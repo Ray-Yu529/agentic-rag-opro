@@ -8,3 +8,7 @@ oracle.json
 cache.json
 results/
 *.png
+
+# 前端
+web/node_modules/
+web/dist/

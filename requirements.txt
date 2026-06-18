@@ -8,3 +8,6 @@ python-dotenv>=1.0.0  # 讀 .env 的 NVIDIA_API_KEY
 tqdm>=4.66.0          # 進度條
 matplotlib>=3.7.0     # D5 對比曲線
 optuna>=3.5.0         # hybrid.py: 數值最佳化收斂
+fastapi>=0.110.0      # server.py: 後端 API
+uvicorn>=0.29.0       # server.py: ASGI server
+pydantic>=2.0.0       # server.py: 請求驗證

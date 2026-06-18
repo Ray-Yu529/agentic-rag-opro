@@ -20,7 +20,8 @@ import random
 from rag import RagConfig, get_client
 from cache import ResultCache, config_to_dict
 from memory.trajectory import Trajectory
-from optimizer import (SEARCH_SPACE, all_configs, objective, _trial, META_MODEL)
+from optimizer import (SEARCH_SPACE, all_configs, objective, _trial, META_MODEL,
+                       _make_say)
 
 
 def _ask_region(traj: Trajectory) -> dict:
@@ -63,7 +64,8 @@ def _ask_region(traj: Trajectory) -> dict:
 
 
 def hybrid_search(examples, cache: ResultCache, budget: int, seed: int, traj_path: str,
-                  n_init: int = 3, verbose: bool = True) -> Trajectory:
+                  n_init: int = 3, verbose: bool = True, log_fn=None) -> Trajectory:
+    say = _make_say(log_fn, verbose)
     try:
         import optuna
     except ImportError as e:
@@ -79,11 +81,11 @@ def hybrid_search(examples, cache: ResultCache, budget: int, seed: int, traj_pat
     # 1) 暖身 (與其他策略同 seed)
     for cfg in grid[:n_init]:
         traj.add(_trial(cache.evaluate_cached(cfg, examples, verbose=verbose), "init"))
+        say(f"[暖身] {config_to_dict(cfg)}")
 
     # 2) LLM 縮範圍
     region = _ask_region(traj)
-    if verbose:
-        print(f"\n[hybrid] LLM 縮範圍後的搜索區域: {region}")
+    say(f"\n[hybrid] LLM 縮範圍後的搜索區域: {region}")
 
     # 3) Optuna 在縮小空間內收斂
     def opt_objective(trial):

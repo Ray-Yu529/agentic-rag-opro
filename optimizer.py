@@ -63,9 +63,17 @@ def _trial(record: dict, source: str) -> Trial:
                  failures=record["failures"], source=source)
 
 
+def _make_say(log_fn, verbose):
+    """log_fn 優先 (後端用); 否則 verbose 時印出。"""
+    if log_fn is not None:
+        return log_fn
+    return print if verbose else (lambda *_: None)
+
+
 # --- D3: Random search baseline -------------------------------------------
 def random_search(examples, cache: ResultCache, budget: int, seed: int,
-                  traj_path: str, verbose: bool = True) -> Trajectory:
+                  traj_path: str, verbose: bool = True, log_fn=None) -> Trajectory:
+    say = _make_say(log_fn, verbose)
     rng = random.Random(seed)
     grid = all_configs()
     rng.shuffle(grid)
@@ -74,6 +82,7 @@ def random_search(examples, cache: ResultCache, budget: int, seed: int,
     for cfg in grid[:budget]:
         rec = cache.evaluate_cached(cfg, examples, verbose=verbose)
         traj.add(_trial(rec, source="random"))
+        say(f"[random] 評估 {config_to_dict(cfg)} -> obj={objective(rec['score']):.3f}")
     return traj
 
 
@@ -182,7 +191,8 @@ def _random_untried(tried: set[tuple], rng: random.Random) -> RagConfig | None:
 
 
 def opro_search(examples, cache: ResultCache, budget: int, seed: int, traj_path: str,
-                n_init: int = 3, verbose: bool = True) -> Trajectory:
+                n_init: int = 3, verbose: bool = True, log_fn=None) -> Trajectory:
+    say = _make_say(log_fn, verbose)
     rng = random.Random(seed)
     grid = all_configs()
     rng.shuffle(grid)
@@ -194,23 +204,22 @@ def opro_search(examples, cache: ResultCache, budget: int, seed: int, traj_path:
     for cfg in grid[:n_init]:
         rec = cache.evaluate_cached(cfg, examples, verbose=verbose)
         traj.add(_trial(rec, source="init"))
+        say(f"[暖身] {config_to_dict(cfg)} -> obj={objective(rec['score']):.3f}")
 
     while len(traj.trials) < budget:
         result = _call_meta(_build_meta_prompt(traj, cache))
-        if verbose:
-            print(f"\n[OPRO round {len(traj.trials) - n_init + 1}] "
-                  f"{result.get('reasoning', '')}")
+        say(f"\n[OPRO 第 {len(traj.trials) - n_init + 1} 輪] 推理: "
+            f"{result.get('reasoning', '')}")
         tried = traj.tried_keys()
         cfg = _pick_valid_untried(result.get("proposals", []), tried)
         if cfg is None:
             cfg = _random_untried(tried, rng)
             if cfg is None:
                 break
-            if verbose:
-                print("  (LLM 無有效提案，後備隨機抽)")
-        if verbose:
-            print(f"  -> 採用 {config_to_dict(cfg)}")
+            say("  (LLM 無有效提案，後備隨機抽)")
+        say(f"  -> 採用 {config_to_dict(cfg)}")
         rec = cache.evaluate_cached(cfg, examples, verbose=verbose)
         traj.add(_trial(rec, source="opro"))
+        say(f"  -> obj={objective(rec['score']):.3f}")
 
     return traj
