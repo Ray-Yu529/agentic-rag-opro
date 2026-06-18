@@ -1,0 +1,9 @@
+.env
+__pycache__/
+*.pyc
+.venv/
+venv/
+# 執行產物 (跑出來才有，不入庫)
+oracle.json
+results/
+*.png
