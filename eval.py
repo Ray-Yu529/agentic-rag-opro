@@ -127,14 +127,18 @@ class QuestionDetail:
     pred: str
     em: float
     f1: float
-    recall: float
-    retrieved_preview: str  # 檢索到的 chunk 前段，讓 LLM 看真因 (檢索 vs 生成)
+    recall: float           # 檢索品質: gold 段落是否被撈到
+    faithful: float         # NLI 忠實度: 答案是否被 context 支持 (1/0)
+    correct: float          # LLM 判官語意正確性 (1/0)
+    fail_type: str          # "ok" | "retrieval" | "generation" — 失敗分群用
+    retrieved_preview: str  # 檢索到的 chunk 前段，讓 LLM 看真因
 
     def as_dict(self) -> dict:
         return {
             "question": self.question, "gold": self.gold, "pred": self.pred,
             "em": self.em, "f1": self.f1, "recall": self.recall,
-            "retrieved_preview": self.retrieved_preview,
+            "faithful": self.faithful, "correct": self.correct,
+            "fail_type": self.fail_type, "retrieved_preview": self.retrieved_preview,
         }
 
 
@@ -143,44 +147,81 @@ class EvalScore:
     em: float
     f1: float
     recall: float
+    faithfulness: float        # 平均忠實度 (1 - 幻覺率)
+    correctness: float         # LLM 判官平均正確率
+    avg_latency: float         # 成本: 每題平均秒數
+    avg_tokens: float          # 成本: 每題平均 token
     n: int
-    details: list[QuestionDetail] = None  # 每題明細 (verbose 不影響，總是收集)
+    details: list[QuestionDetail] = None
 
     def as_dict(self) -> dict:
-        return {"em": self.em, "f1": self.f1, "recall": self.recall, "n": self.n}
+        return {"em": self.em, "f1": self.f1, "recall": self.recall,
+                "faithfulness": self.faithfulness, "correctness": self.correctness,
+                "avg_latency": self.avg_latency, "avg_tokens": self.avg_tokens, "n": self.n}
+
+    def hallucination_rate(self) -> float:
+        return 1.0 - self.faithfulness
 
     def worst_cases(self, k: int = 2) -> list[QuestionDetail]:
-        """挑 f1 最低的 k 題 (OPRO 錯誤分析用)。"""
+        """挑最該檢討的 k 題: 先看答錯 (correct=0)，再依 f1 排。"""
         if not self.details:
             return []
-        return sorted(self.details, key=lambda d: d.f1)[:k]
+        return sorted(self.details, key=lambda d: (d.correct, d.f1))[:k]
+
+    def fail_clusters(self) -> dict[str, int]:
+        """失敗分群計數，餵給 OPRO 推論瓶頸在檢索還是生成。"""
+        clusters = {"retrieval": 0, "generation": 0}
+        for d in (self.details or []):
+            if d.fail_type in clusters:
+                clusters[d.fail_type] += 1
+        return clusters
+
+
+def _classify(recall: float, correct: float) -> str:
+    """recall<1 -> 檢索沒撈全; 撈到了卻答錯 -> 生成端問題。"""
+    if recall < 1.0:
+        return "retrieval"
+    if correct < 1.0:
+        return "generation"
+    return "ok"
 
 
 def evaluate(cfg: RagConfig, examples: list[Example], verbose: bool = True) -> EvalScore:
-    em_sum = f1_sum = rec_sum = 0.0
+    # 局部 import 避免模組載入順序問題
+    from judge import judge_correctness, judge_faithfulness
+
+    em_s = f1_s = rec_s = faith_s = corr_s = lat_s = tok_s = 0.0
     details: list[QuestionDetail] = []
     iterator = tqdm(examples, desc=str(cfg.key()), disable=not verbose)
     for ex in iterator:
         try:
             res = run_rag(ex.question, ex.paragraphs, cfg)
-        except Exception as e:  # noqa: BLE001  — Demo 期間單題失敗不該中斷整輪
+        except Exception as e:  # noqa: BLE001  — 單題失敗不該中斷整輪
             if verbose:
                 tqdm.write(f"[warn] 題目失敗，記 0 分: {e}")
             continue
         em = exact_match(res.answer, ex.answer)
         f1 = f1_score(res.answer, ex.answer)
         rec = retrieval_recall(res.retrieved_chunks, ex.gold_paragraphs)
-        em_sum += em
-        f1_sum += f1
-        rec_sum += rec
-        preview = " | ".join(c[:120] for c in res.retrieved_chunks[:3])
+        # verify 已算過忠實度就重用，否則補算 (確保所有配置都有此指標可比)
+        faithful = res.faithful if res.faithful is not None \
+            else judge_faithfulness(res.answer, res.retrieved_chunks)
+        correct = judge_correctness(ex.question, res.answer, ex.answer)
+
+        em_s += em; f1_s += f1; rec_s += rec; faith_s += faithful; corr_s += correct
+        lat_s += res.latency; tok_s += res.tokens
         details.append(QuestionDetail(
             question=ex.question, gold=ex.answer, pred=res.answer,
-            em=em, f1=f1, recall=rec, retrieved_preview=preview,
+            em=em, f1=f1, recall=rec, faithful=faithful, correct=correct,
+            fail_type=_classify(rec, correct),
+            retrieved_preview=" | ".join(c[:120] for c in res.retrieved_chunks[:3]),
         ))
 
     n = len(examples)
-    return EvalScore(em=em_sum / n, f1=f1_sum / n, recall=rec_sum / n, n=n, details=details)
+    return EvalScore(em=em_s / n, f1=f1_s / n, recall=rec_s / n,
+                     faithfulness=faith_s / n, correctness=corr_s / n,
+                     avg_latency=lat_s / n, avg_tokens=tok_s / n,
+                     n=n, details=details)
 
 
 if __name__ == "__main__":
@@ -191,6 +232,9 @@ if __name__ == "__main__":
     cfg = RagConfig(chunk_size=512, top_k=5, retriever="hybrid")
     score = evaluate(cfg, examples)
     print(f"\n配置 {cfg.key()}")
-    print(f"  EM     = {score.em:.3f}")
-    print(f"  F1     = {score.f1:.3f}")
-    print(f"  recall = {score.recall:.3f}")
+    print(f"  EM           = {score.em:.3f}")
+    print(f"  F1           = {score.f1:.3f}")
+    print(f"  recall       = {score.recall:.3f}")
+    print(f"  correctness  = {score.correctness:.3f} (LLM judge)")
+    print(f"  faithfulness = {score.faithfulness:.3f} (幻覺率 {score.hallucination_rate():.3f})")
+    print(f"  cost         = {score.avg_latency:.2f}s, {score.avg_tokens:.0f} tok/題")

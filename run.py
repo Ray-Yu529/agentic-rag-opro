@@ -1,13 +1,10 @@
 """
-run.py — D5 主編排: random vs OPRO 對照實驗
+run.py — 主編排: random vs OPRO vs hybrid 對照 (多目標)
 
-前提: 已跑過 sweep.py 產生 oracle.json。
-本檔不做大量 RAG 評估 (分數查 oracle)，只有 OPRO 會呼叫 meta-LLM 推理。
+搜索空間 216 組，三種策略各用 BUDGET 次評估去找最佳配置。
+分數查共用 cache.json (查過不重跑)，OPRO/hybrid 額外呼叫 meta-LLM 推理。
 
-產出:
-  results/random.jsonl  — random search 軌跡
-  results/opro.jsonl     — OPRO 軌跡
-之後跑 plot.py 出對比曲線。
+產出 results/*.jsonl，之後跑 plot.py 出對比曲線 + Pareto 圖。
 """
 
 from __future__ import annotations
@@ -16,39 +13,49 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-from optimizer import load_oracle, random_search, opro_search
+from eval import load_hotpot
+from cache import ResultCache
+from optimizer import random_search, opro_search
+from hybrid import hybrid_search
 
 load_dotenv()
 
 RESULTS = Path(__file__).parent / "results"
-BUDGET = 8     # 兩種策略各跑幾次評估 (27 組裡只試 8 組)
+BUDGET = 10    # 每種策略的評估次數 (216 組裡只試 10 組)
 SEED = 42
-N_INIT = 3     # OPRO 暖身組數 (與 random 同 seed，公平起跑)
+N_INIT = 3     # 暖身組數 (三種策略同 seed，公平起跑)
 
 
 def summarize(name: str, traj) -> None:
-    best = traj.best()
-    print(f"\n[{name}] {len(traj.trials)} 次評估，best F1 = {best.objective:.3f} "
-          f"@ chunk={best.config['chunk_size']}, top_k={best.config['top_k']}, "
-          f"retriever={best.config['retriever']}")
+    b = traj.best()
+    c = b.config
+    print(f"\n[{name}] {len(traj.trials)} 次評估 | best obj={b.objective:.3f} "
+          f"(正確率={b.score['correctness']:.2f}, 幻覺率={1-b.score['faithfulness']:.2f})")
+    print(f"        最佳配置: chunk={c['chunk_size']}, top_k={c['top_k']}, "
+          f"ret={c['retriever']}, rerank={c['rerank']}, "
+          f"decomp={c['query_decompose']}, verify={c['verify']}")
 
 
 def main() -> None:
-    oracle = load_oracle()
-    oracle_best = max(r["objective"] for r in oracle.values())
-    print(f"oracle 全域最佳 F1 = {oracle_best:.3f} (27 組的真最佳，當作天花板)\n")
+    examples = load_hotpot(n=30, n_hard=15)
+    cache = ResultCache()  # 與 sweep 共用; 已掃過的核心網格在這免費重用
 
     print("=== Random search baseline ===")
-    rand = random_search(oracle, budget=BUDGET, seed=SEED,
+    rand = random_search(examples, cache, budget=BUDGET, seed=SEED,
                          traj_path=str(RESULTS / "random.jsonl"))
     summarize("random", rand)
 
     print("\n=== OPRO meta-optimizer ===")
-    opro = opro_search(oracle, budget=BUDGET, seed=SEED, n_init=N_INIT,
+    opro = opro_search(examples, cache, budget=BUDGET, seed=SEED, n_init=N_INIT,
                        traj_path=str(RESULTS / "opro.jsonl"))
     summarize("opro", opro)
 
-    print("\n完成。跑 plot.py 出對比曲線。")
+    print("\n=== Hybrid (LLM 縮範圍 + Optuna 收斂) ===")
+    hyb = hybrid_search(examples, cache, budget=BUDGET, seed=SEED, n_init=N_INIT,
+                        traj_path=str(RESULTS / "hybrid.jsonl"))
+    summarize("hybrid", hyb)
+
+    print("\n完成。跑 plot.py 出對比曲線 + Pareto 圖。")
 
 
 if __name__ == "__main__":

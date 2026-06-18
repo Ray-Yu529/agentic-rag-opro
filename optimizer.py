@@ -1,13 +1,15 @@
 """
-optimizer.py — 搜索空間 + random baseline (D3) + OPRO 迴路 (D4)
+optimizer.py — 搜索空間 + 多目標 + random baseline (D3) + OPRO 迴路 (D4)
 
-關鍵設計 (省錢可重現):
-  搜索空間只有 27 組，先用 sweep.py 把每組的真實分數+失敗案例存成 oracle.json。
-  之後 random / OPRO 兩種策略「查 oracle 取分數」(零額外 API)，
-  OPRO 唯一的 API 花費就是 meta-agent 的推理呼叫。
+搜索空間 (加了 3 個 agentic 開關後 = 216 組):
+  chunk_size × top_k × retriever × rerank × query_decompose × verify
+全掃不可行 -> random / OPRO 都用 cache.evaluate_cached 即時評估 (查過不重跑)。
 
-去重與合法性檢查放在程式裡 (is_valid / tried_keys)，不靠 prompt 約束 —
-  因為 LLM 常常嘴上說探索新區、實際給你重複的舊值。
+多目標 objective: 最大化正確率、同時懲罰幻覺
+  objective = correctness - LAMBDA * hallucination_rate
+(成本 avg_latency/avg_tokens 不進純量，留給 Pareto 圖看權衡。)
+
+去重 / 合法性檢查放程式裡 (is_valid / tried_keys)，不靠 prompt 約束。
 """
 
 from __future__ import annotations
@@ -16,143 +18,138 @@ import json
 import re
 import random
 from itertools import product
-from pathlib import Path
 
-from rag import RagConfig, GEN_MODEL, get_client
+from rag import RagConfig, get_client
+from cache import ResultCache, config_to_dict, dict_to_config
 from memory.trajectory import Trajectory, Trial
 
-# meta-optimizer 用大模型 (推理量小，每輪 1 次)
-META_MODEL = "nvidia/llama-3.1-nemotron-70b-instruct"
+META_MODEL = "nvidia/llama-3.1-nemotron-70b-instruct"  # meta-optimizer (推理量小)
+LAMBDA = 0.5  # 幻覺懲罰權重
 
-ORACLE_PATH = Path(__file__).parent / "oracle.json"
-
-# --- 搜索空間 θ (Demo 縮到 3 維, 共 27 組) --------------------------------
+# --- 搜索空間 θ (216 組) ---------------------------------------------------
 SEARCH_SPACE = {
     "chunk_size": [256, 512, 1024],
     "top_k": [3, 5, 8],
     "retriever": ["bm25", "dense", "hybrid"],
+    "rerank": [False, True],
+    "query_decompose": [False, True],
+    "verify": [False, True],
 }
 
 
 def all_configs() -> list[RagConfig]:
-    combos = product(SEARCH_SPACE["chunk_size"],
-                     SEARCH_SPACE["top_k"],
-                     SEARCH_SPACE["retriever"])
-    return [RagConfig(chunk_size=c, top_k=k, retriever=r) for c, k, r in combos]
-
-
-def key_str(cfg_or_dict) -> str:
-    """config 的唯一字串鍵 (oracle 查表 / 去重用)。"""
-    if isinstance(cfg_or_dict, RagConfig):
-        c, k, r = cfg_or_dict.chunk_size, cfg_or_dict.top_k, cfg_or_dict.retriever
-    else:
-        c, k, r = cfg_or_dict["chunk_size"], cfg_or_dict["top_k"], cfg_or_dict["retriever"]
-    return f"{c}-{k}-{r}"
+    keys = list(SEARCH_SPACE)
+    return [RagConfig(**dict(zip(keys, combo)))
+            for combo in product(*(SEARCH_SPACE[k] for k in keys))]
 
 
 def is_valid(d: dict) -> bool:
-    """LLM 提案的合法性檢查 (必須落在 grid 上)。"""
+    """LLM 提案的合法性檢查 (每個欄位必須落在 grid 上)。"""
     try:
-        return (d["chunk_size"] in SEARCH_SPACE["chunk_size"]
-                and d["top_k"] in SEARCH_SPACE["top_k"]
-                and d["retriever"] in SEARCH_SPACE["retriever"])
+        return all(d[k] in SEARCH_SPACE[k] for k in SEARCH_SPACE)
     except (KeyError, TypeError):
         return False
 
 
-# --- Oracle 存取 -----------------------------------------------------------
-def load_oracle(path: Path = ORACLE_PATH) -> dict[str, dict]:
-    """回傳 {key_str: {config, score, objective, failures}}。"""
-    if not Path(path).exists():
-        raise FileNotFoundError(
-            f"找不到 {path}。請先跑 sweep.py 產生 oracle (D2.5)。"
-        )
-    records = json.loads(Path(path).read_text(encoding="utf-8"))
-    return {key_str(r["config"]): r for r in records}
+def objective(score: dict) -> float:
+    """多目標純量化: 正確率 - λ·幻覺率。"""
+    hallucination = 1.0 - score.get("faithfulness", 1.0)
+    return score.get("correctness", 0.0) - LAMBDA * hallucination
 
 
-def _trial_from_oracle(oracle: dict, cfg: RagConfig, source: str) -> Trial:
-    rec = oracle[key_str(cfg)]
-    return Trial(config=rec["config"], score=rec["score"],
-                 objective=rec["objective"], failures=rec["failures"], source=source)
+def _trial(record: dict, source: str) -> Trial:
+    return Trial(config=record["config"], score=record["score"],
+                 objective=objective(record["score"]),
+                 failures=record["failures"], source=source)
 
 
 # --- D3: Random search baseline -------------------------------------------
-def random_search(oracle: dict, budget: int, seed: int, traj_path: str) -> Trajectory:
+def random_search(examples, cache: ResultCache, budget: int, seed: int,
+                  traj_path: str, verbose: bool = True) -> Trajectory:
     rng = random.Random(seed)
     grid = all_configs()
     rng.shuffle(grid)
     traj = Trajectory(traj_path)
     traj.reset()
     for cfg in grid[:budget]:
-        traj.add(_trial_from_oracle(oracle, cfg, source="random"))
+        rec = cache.evaluate_cached(cfg, examples, verbose=verbose)
+        traj.add(_trial(rec, source="random"))
     return traj
 
 
 # --- D4: OPRO meta-optimizer -----------------------------------------------
-def _build_meta_prompt(traj: Trajectory) -> str:
-    """把軌跡 (已試配置 + 失敗案例) 整理成給 meta-agent 的反思+提案任務。"""
-    # 1) 已試配置，依 F1 排名 (先幫它算好排名，LLM 對純數字不敏感)
+def _build_meta_prompt(traj: Trajectory, cache: ResultCache) -> str:
     ranked = sorted(traj.trials, key=lambda t: t.objective, reverse=True)
     lines = []
     for rank, t in enumerate(ranked, 1):
-        c = t.config
+        c, s = t.config, t.score
         lines.append(
-            f"  #{rank} chunk_size={c['chunk_size']}, top_k={c['top_k']}, "
-            f"retriever={c['retriever']:6s} -> F1={t.score['f1']:.3f}, "
-            f"recall={t.score['recall']:.3f}, EM={t.score['em']:.3f}"
+            f"  #{rank} chunk={c['chunk_size']}, top_k={c['top_k']}, ret={c['retriever']:6s}, "
+            f"rerank={int(c['rerank'])}, decomp={int(c['query_decompose'])}, "
+            f"verify={int(c['verify'])} "
+            f"-> 正確率={s['correctness']:.2f}, 幻覺率={1-s['faithfulness']:.2f}, "
+            f"recall={s['recall']:.2f}, obj={t.objective:.3f}, "
+            f"成本={s['avg_latency']:.1f}s/{s['avg_tokens']:.0f}tok"
         )
     table = "\n".join(lines)
 
-    # 2) 最佳配置仍答錯的題 (錯誤分析素材，含檢索預覽看真因)
+    # 最佳配置的失敗分群 + 代表失敗題 (錯誤分析素材)
     best = ranked[0]
+    best_rec = cache.get(dict_to_config(best.config))
+    clusters = best_rec.get("fail_clusters", {}) if best_rec else {}
     fail_lines = []
     for f in best.failures[:2]:
         fail_lines.append(
-            f"  - Q: {f['question']}\n"
-            f"    正解: {f['gold']} | 系統答: {f['pred']} (F1={f['f1']:.2f}, recall={f['recall']:.2f})\n"
-            f"    檢索到的片段: {f['retrieved_preview'][:300]}"
+            f"  - [{f.get('fail_type','?')}] Q: {f['question']}\n"
+            f"    正解: {f['gold']} | 系統答: {f['pred']} "
+            f"(recall={f['recall']:.1f}, 忠實={f.get('faithful',0):.0f})\n"
+            f"    檢索片段: {f['retrieved_preview'][:240]}"
         )
     fails = "\n".join(fail_lines) if fail_lines else "  (無)"
 
-    tried = ", ".join(sorted(key_str(t.config) for t in traj.trials))
+    tried = ", ".join(sorted(
+        "|".join(str(t.config[k]) for k in SEARCH_SPACE) for t in traj.trials))
 
-    return f"""你是一個 RAG 系統最佳化架構師。我們在用實驗逐步調參，目標是最大化 F1。
+    return f"""你是 RAG 系統最佳化架構師。目標: 最大化 objective = 正確率 - {LAMBDA}×幻覺率。
 
-合法參數值 (提案必須從這裡選，不可超出):
-  chunk_size ∈ {SEARCH_SPACE['chunk_size']}
-  top_k      ∈ {SEARCH_SPACE['top_k']}
-  retriever  ∈ {SEARCH_SPACE['retriever']}
+合法參數值 (提案必須從這裡選):
+  chunk_size      ∈ {SEARCH_SPACE['chunk_size']}
+  top_k           ∈ {SEARCH_SPACE['top_k']}
+  retriever       ∈ {SEARCH_SPACE['retriever']}
+  rerank          ∈ [false, true]   (檢索後重排)
+  query_decompose ∈ [false, true]   (多跳問題拆解，HotpotQA 是多跳)
+  verify          ∈ [false, true]   (NLI 自我檢查，降幻覺但增成本)
 
-目前已測試的配置 (依 F1 由高到低):
+已測配置 (依 objective 由高到低):
 {table}
 
-目前最佳配置 (#{1}) 仍然答錯的代表題:
+目前最佳配置的失敗分群: {clusters}  (retrieval=檢索沒撈全, generation=撈到卻答錯)
+代表失敗題:
 {fails}
 
-已測過、請勿重複的配置: {tried}
+已測過、請勿重複: {tried}
 
-請依下列步驟思考:
-1. 分析: 從失敗案例與分數排名，推論目前的瓶頸在「檢索」(recall 低) 還是「生成/雜訊」(recall 高但 F1 低)?
-2. 策略: 若早期 (探索) 請提差異大的組合; 若已逼近最佳 (利用) 請在最佳配置附近微調。
-3. 提案: 給出最多 2 組「未測過」且最值得測的配置。
+請依步驟思考:
+1. 診斷: 從失敗分群看瓶頸在「檢索」還是「生成/幻覺」?
+   - 檢索瓶頸 (retrieval 多) -> 試 query_decompose / rerank / 調大 top_k / 換 retriever
+   - 生成瓶頸或幻覺高 -> 試 verify / 調整 chunk_size
+2. 探索 vs 利用: 早期提差異大的組合; 後期在最佳配置附近微調。
+3. 提案最多 2 組「未測過」且最值得測的配置。
 
-只輸出 JSON，格式如下，不要其他文字:
-{{"reasoning": "你的分析與推論 (繁體中文，2-4 句)",
-  "proposals": [{{"chunk_size": 512, "top_k": 5, "retriever": "hybrid"}}]}}"""
+只輸出 JSON，不要其他文字:
+{{"reasoning": "你的診斷與推論 (繁體中文，2-4 句)",
+  "proposals": [{{"chunk_size":512,"top_k":5,"retriever":"hybrid","rerank":true,"query_decompose":true,"verify":false}}]}}"""
 
 
 def _call_meta(prompt: str) -> dict:
-    """呼叫 meta-LLM 並解析 JSON。失敗回空 proposals。"""
     client = get_client()
     resp = client.chat.completions.create(
         model=META_MODEL,
         messages=[{"role": "user", "content": prompt}],
         temperature=0.4,
-        max_tokens=600,
+        max_tokens=800,
     )
-    text = resp.choices[0].message.content
-    m = re.search(r"\{.*\}", text, re.DOTALL)  # 容忍模型多吐的前後綴
+    m = re.search(r"\{.*\}", resp.choices[0].message.content, re.DOTALL)
     if not m:
         return {"reasoning": "(解析失敗)", "proposals": []}
     try:
@@ -161,34 +158,31 @@ def _call_meta(prompt: str) -> dict:
         return {"reasoning": "(JSON 解析失敗)", "proposals": []}
 
 
-def _pick_valid_untried(proposals: list[dict], tried: set[tuple],
-                        oracle: dict) -> RagConfig | None:
-    """程式端硬性篩選: 合法 + 未試過 + oracle 有分數。"""
+def _config_from_proposal(d: dict) -> RagConfig:
+    return RagConfig(
+        chunk_size=d["chunk_size"], top_k=d["top_k"], retriever=d["retriever"],
+        rerank=bool(d["rerank"]), query_decompose=bool(d["query_decompose"]),
+        verify=bool(d["verify"]),
+    )
+
+
+def _pick_valid_untried(proposals: list[dict], tried: set[tuple]) -> RagConfig | None:
     for d in proposals:
         if not is_valid(d):
             continue
-        cfg = RagConfig(chunk_size=d["chunk_size"], top_k=d["top_k"], retriever=d["retriever"])
-        if cfg.key() in tried:
-            continue
-        if key_str(cfg) not in oracle:
-            continue
-        return cfg
+        cfg = _config_from_proposal(d)
+        if cfg.key() not in tried:
+            return cfg
     return None
 
 
-def _random_untried(tried: set[tuple], oracle: dict, rng: random.Random) -> RagConfig | None:
-    """LLM 沒給有效提案時的後備: 隨機抓一個沒試過的。"""
-    pool = [c for c in all_configs()
-            if c.key() not in tried and key_str(c) in oracle]
+def _random_untried(tried: set[tuple], rng: random.Random) -> RagConfig | None:
+    pool = [c for c in all_configs() if c.key() not in tried]
     return rng.choice(pool) if pool else None
 
 
-def opro_search(oracle: dict, budget: int, seed: int, traj_path: str,
+def opro_search(examples, cache: ResultCache, budget: int, seed: int, traj_path: str,
                 n_init: int = 3, verbose: bool = True) -> Trajectory:
-    """
-    n_init 組隨機暖身 (與 random_search 同 seed，公平起跑)，
-    其餘預算交給 OPRO meta-agent 反思後提案。
-    """
     rng = random.Random(seed)
     grid = all_configs()
     rng.shuffle(grid)
@@ -196,28 +190,27 @@ def opro_search(oracle: dict, budget: int, seed: int, traj_path: str,
     traj = Trajectory(traj_path)
     traj.reset()
 
-    # 暖身: 與 random baseline 相同的前 n_init 組
+    # 暖身: 與 random baseline 相同 seed 的前 n_init 組 (公平起跑)
     for cfg in grid[:n_init]:
-        traj.add(_trial_from_oracle(oracle, cfg, source="init"))
+        rec = cache.evaluate_cached(cfg, examples, verbose=verbose)
+        traj.add(_trial(rec, source="init"))
 
-    # OPRO 迴路
     while len(traj.trials) < budget:
-        prompt = _build_meta_prompt(traj)
-        result = _call_meta(prompt)
+        result = _call_meta(_build_meta_prompt(traj, cache))
         if verbose:
             print(f"\n[OPRO round {len(traj.trials) - n_init + 1}] "
-                  f"reasoning: {result.get('reasoning', '')}")
-
+                  f"{result.get('reasoning', '')}")
         tried = traj.tried_keys()
-        cfg = _pick_valid_untried(result.get("proposals", []), tried, oracle)
+        cfg = _pick_valid_untried(result.get("proposals", []), tried)
         if cfg is None:
-            cfg = _random_untried(tried, oracle, rng)  # 後備
+            cfg = _random_untried(tried, rng)
             if cfg is None:
-                break  # 全部試完了
+                break
             if verbose:
                 print("  (LLM 無有效提案，後備隨機抽)")
         if verbose:
-            print(f"  -> 採用配置 {key_str(cfg)}")
-        traj.add(_trial_from_oracle(oracle, cfg, source="opro"))
+            print(f"  -> 採用 {config_to_dict(cfg)}")
+        rec = cache.evaluate_cached(cfg, examples, verbose=verbose)
+        traj.add(_trial(rec, source="opro"))
 
     return traj
