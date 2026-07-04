@@ -3,8 +3,9 @@ memory/trajectory.py — 經驗軌跡庫 (D3)
 
 一次最佳化 run 的試驗序列，存成 jsonl。每筆 Trial 記:
 - config : 試了哪組參數
-- score  : EM / F1 / recall
-- objective : 拿來最佳化的純量 (Demo 用 F1)
+- score  : em/f1/recall/faithfulness/correctness/abstain_rate/成本
+- objective : 拿來最佳化的純量 (正確率 - λ×幻覺率)
+- lam    : 當時的 λ (不同權重的軌跡不可混著比)
 - failures  : 1~2 個最糟的題 (含檢索預覽)，給 OPRO 做錯誤分析
 
 OPRO 的 meta-agent 就是讀這個庫來推論下一步。
@@ -19,11 +20,12 @@ from pathlib import Path
 
 @dataclass
 class Trial:
-    config: dict                      # {chunk_size, top_k, retriever, chunk_overlap}
-    score: dict                       # {em, f1, recall, n}
-    objective: float                  # 最佳化目標 (F1)
+    config: dict                      # {chunk_size, top_k, retriever, ...agentic 開關}
+    score: dict                       # {em, f1, recall, faithfulness, correctness, ...}
+    objective: float                  # 最佳化目標 (正確率 - λ×幻覺率)
     failures: list[dict] = field(default_factory=list)
-    source: str = "init"              # "init" | "random" | "opro" — 標記是誰提出的
+    source: str = "init"              # "init" | "random" | "opro" | "hybrid"
+    lam: float | None = None          # 計算 objective 時用的 λ
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), ensure_ascii=False)

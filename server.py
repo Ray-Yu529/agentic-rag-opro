@@ -14,6 +14,7 @@ server.py — FastAPI 後端: 把 optimizer 包成 API 給 React 前端用
 from __future__ import annotations
 
 import threading
+from functools import lru_cache
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -23,7 +24,7 @@ from pydantic import BaseModel
 
 import optimizer
 from eval import load_hotpot
-from cache import ResultCache
+from cache import DEFAULT_DATASET, ResultCache, dataset_key
 from optimizer import random_search, opro_search, objective
 from hybrid import hybrid_search
 from memory.trajectory import Trajectory
@@ -38,8 +39,14 @@ app.add_middleware(
 
 # --- 全域任務狀態 (Demo: 一次跑一個) --------------------------------------
 STATE: dict = {"running": False, "strategy": None, "done": 0, "total": 0,
-               "log": [], "error": None}
+               "log": [], "error": None, "dataset": DEFAULT_DATASET}
 _lock = threading.Lock()
+
+
+@lru_cache(maxsize=4)
+def _load_examples(n: int, n_hard: int) -> list:
+    """同參數的測試集只載一次 (load_hotpot 要下載/掃 HotpotQA，很慢)。"""
+    return load_hotpot(n=n, n_hard=n_hard)
 
 
 class RunReq(BaseModel):
@@ -58,9 +65,11 @@ def _log(msg: str) -> None:
 
 def _job(req: RunReq) -> None:
     try:
-        optimizer.LAMBDA = req.lam  # 即時調整目標權重
-        examples = load_hotpot(n=req.n, n_hard=min(req.n_hard, req.n))
-        cache = ResultCache()
+        optimizer.LAMBDA = req.lam  # 即時調整目標權重 (λ 會記進每筆 Trial)
+        n_hard = min(req.n_hard, req.n)
+        examples = _load_examples(req.n, n_hard)
+        # 快取鍵含測試集 fingerprint: 改題數後不會沿用到舊測試集的分數
+        cache = ResultCache(dataset=dataset_key(req.n, n_hard))
         traj_path = str(RESULTS / f"{req.strategy}.jsonl")
         common = dict(examples=examples, cache=cache, budget=req.budget,
                       seed=42, traj_path=traj_path, verbose=False, log_fn=_log)
@@ -86,21 +95,23 @@ def run(req: RunReq):
         if STATE["running"]:
             return {"ok": False, "msg": "已有任務在執行"}
         STATE.update(running=True, strategy=req.strategy, done=0,
-                     total=req.budget, log=[], error=None)
+                     total=req.budget, log=[], error=None,
+                     dataset=dataset_key(req.n, min(req.n_hard, req.n)))
     threading.Thread(target=_job, args=(req,), daemon=True).start()
     return {"ok": True}
 
 
 @app.get("/api/status")
 def status():
+    with _lock:
+        snapshot = dict(STATE)
     # done 以當前策略軌跡檔的試驗數即時回報
     done = 0
-    if STATE["strategy"]:
-        p = RESULTS / f"{STATE['strategy']}.jsonl"
+    if snapshot["strategy"]:
+        p = RESULTS / f"{snapshot['strategy']}.jsonl"
         if p.exists():
             done = sum(1 for _ in p.read_text(encoding="utf-8").splitlines() if _.strip())
-    with _lock:
-        return {**STATE, "done": done}
+    return {**snapshot, "done": done}
 
 
 def _pareto(points):
@@ -125,6 +136,7 @@ def results():
             continue
         strategies[name] = {
             "curve": traj.best_curve(),
+            "lam": traj.trials[-1].lam,   # 該軌跡實際使用的 λ (跨 run 可能不同)
             "trials": [{"config": t.config, "score": t.score,
                         "objective": t.objective, "source": t.source}
                        for t in traj.trials],
@@ -134,7 +146,10 @@ def results():
             overall_best = {"strategy": name, "config": b.config,
                             "score": b.score, "objective": b.objective}
 
-    cache = ResultCache()
+    # Pareto 只取「目前這個測試集」的 record，不同題數的分數不混著畫
+    with _lock:
+        dataset = STATE["dataset"]
+    cache = ResultCache(dataset=dataset)
     pts = [{"key": r["config"], "hallucination": 1 - r["score"]["faithfulness"],
             "correctness": r["score"]["correctness"]} for r in cache.all_records()]
     return {"strategies": strategies, "best": overall_best,

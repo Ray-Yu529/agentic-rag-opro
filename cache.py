@@ -7,7 +7,8 @@ cache.py — 快取式評估
 
 random / OPRO / hybrid 共用同一個 cache.json，重疊到的配置零成本。
 
-注意: 快取以 config 為鍵，假設測試集固定 (load_hotpot 的 n/n_hard/seed 不變)。
+快取鍵 = 測試集 fingerprint + config: 不同 (n, n_hard, seed) 的測試集
+分數不可比，各自成一格，避免 Web UI 改題數後沿用到舊測試集的分數。
 """
 
 from __future__ import annotations
@@ -23,6 +24,14 @@ _FIELDS = ("chunk_size", "top_k", "retriever", "chunk_overlap",
            "rerank", "query_decompose", "verify")
 
 
+def dataset_key(n: int, n_hard: int, seed: int = 42) -> str:
+    """測試集 fingerprint (load_hotpot 的參數)。"""
+    return f"hotpot|n={n}|hard={n_hard}|seed={seed}"
+
+
+DEFAULT_DATASET = dataset_key(30, 15, 42)   # CLI (sweep/run/plot) 的預設測試集
+
+
 def config_to_dict(cfg: RagConfig) -> dict:
     return {f: getattr(cfg, f) for f in _FIELDS}
 
@@ -31,20 +40,24 @@ def dict_to_config(d: dict) -> RagConfig:
     return RagConfig(**{f: d[f] for f in _FIELDS if f in d})
 
 
-def key(cfg_or_dict) -> str:
+def config_key(cfg_or_dict) -> str:
     d = config_to_dict(cfg_or_dict) if isinstance(cfg_or_dict, RagConfig) else cfg_or_dict
     return "|".join(str(d[f]) for f in _FIELDS)
 
 
 class ResultCache:
-    def __init__(self, path: Path = CACHE_PATH):
+    def __init__(self, path: Path = CACHE_PATH, dataset: str = DEFAULT_DATASET):
         self.path = Path(path)
+        self.dataset = dataset
         self.store: dict[str, dict] = {}
         if self.path.exists():
             self.store = json.loads(self.path.read_text(encoding="utf-8"))
 
+    def _key(self, cfg: RagConfig) -> str:
+        return f"{self.dataset}::{config_key(cfg)}"
+
     def get(self, cfg: RagConfig) -> dict | None:
-        return self.store.get(key(cfg))
+        return self.store.get(self._key(cfg))
 
     def _save(self) -> None:
         self.path.write_text(
@@ -63,9 +76,11 @@ class ResultCache:
             "failures": [d.as_dict() for d in score.worst_cases(2)],
             "fail_clusters": score.fail_clusters(),
         }
-        self.store[key(cfg)] = record
+        self.store[self._key(cfg)] = record
         self._save()
         return record
 
     def all_records(self) -> list[dict]:
-        return list(self.store.values())
+        """只回傳「同一個測試集」的 record — 不同題數/種子的分數不可混著比。"""
+        prefix = f"{self.dataset}::"
+        return [rec for k, rec in self.store.items() if k.startswith(prefix)]

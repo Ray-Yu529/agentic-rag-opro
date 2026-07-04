@@ -19,12 +19,33 @@ import re
 import random
 from itertools import product
 
-from rag import RagConfig, get_client
+from rag import RagConfig, api_call, get_client
 from cache import ResultCache, config_to_dict, dict_to_config
 from memory.trajectory import Trajectory, Trial
 
 META_MODEL = "nvidia/llama-3.1-nemotron-70b-instruct"  # meta-optimizer (推理量小)
 LAMBDA = 0.5  # 幻覺懲罰權重
+
+
+def chat_json(prompt: str, temperature: float, max_tokens: int) -> dict:
+    """呼叫 meta LLM 並解析 JSON。優先用 API 的 JSON mode；
+    模型不支援時退回一般模式 + regex 擷取。解析失敗回 {}。"""
+    client = get_client()
+    kwargs = dict(model=META_MODEL,
+                  messages=[{"role": "user", "content": prompt}],
+                  temperature=temperature, max_tokens=max_tokens)
+    try:
+        resp = api_call(client.chat.completions.create,
+                        response_format={"type": "json_object"}, **kwargs)
+    except Exception:  # noqa: BLE001 — 端點不支援 JSON mode 時退回一般模式
+        resp = api_call(client.chat.completions.create, **kwargs)
+    m = re.search(r"\{.*\}", resp.choices[0].message.content, re.DOTALL)
+    if not m:
+        return {}
+    try:
+        return json.loads(m.group(0))
+    except json.JSONDecodeError:
+        return {}
 
 # --- 搜索空間 θ (216 組) ---------------------------------------------------
 SEARCH_SPACE = {
@@ -60,7 +81,8 @@ def objective(score: dict) -> float:
 def _trial(record: dict, source: str) -> Trial:
     return Trial(config=record["config"], score=record["score"],
                  objective=objective(record["score"]),
-                 failures=record["failures"], source=source)
+                 failures=record["failures"], source=source,
+                 lam=LAMBDA)  # 記下當時的 λ，避免不同權重的軌跡混著比
 
 
 def _make_say(log_fn, verbose):
@@ -97,6 +119,7 @@ def _build_meta_prompt(traj: Trajectory, cache: ResultCache) -> str:
             f"rerank={int(c['rerank'])}, decomp={int(c['query_decompose'])}, "
             f"verify={int(c['verify'])} "
             f"-> 正確率={s['correctness']:.2f}, 幻覺率={1-s['faithfulness']:.2f}, "
+            f"棄答率={s.get('abstain_rate', 0):.2f}, "
             f"recall={s['recall']:.2f}, obj={t.objective:.3f}, "
             f"成本={s['avg_latency']:.1f}s/{s['avg_tokens']:.0f}tok"
         )
@@ -151,20 +174,10 @@ def _build_meta_prompt(traj: Trajectory, cache: ResultCache) -> str:
 
 
 def _call_meta(prompt: str) -> dict:
-    client = get_client()
-    resp = client.chat.completions.create(
-        model=META_MODEL,
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.4,
-        max_tokens=800,
-    )
-    m = re.search(r"\{.*\}", resp.choices[0].message.content, re.DOTALL)
-    if not m:
-        return {"reasoning": "(解析失敗)", "proposals": []}
-    try:
-        return json.loads(m.group(0))
-    except json.JSONDecodeError:
+    result = chat_json(prompt, temperature=0.4, max_tokens=800)
+    if not result:
         return {"reasoning": "(JSON 解析失敗)", "proposals": []}
+    return result
 
 
 def _config_from_proposal(d: dict) -> RagConfig:

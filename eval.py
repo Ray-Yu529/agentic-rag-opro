@@ -149,6 +149,7 @@ class EvalScore:
     recall: float
     faithfulness: float        # 平均忠實度 (1 - 幻覺率)
     correctness: float         # LLM 判官平均正確率
+    abstain_rate: float        # verify 守門員棄答比例 (棄答≠幻覺，單獨追蹤)
     avg_latency: float         # 成本: 每題平均秒數
     avg_tokens: float          # 成本: 每題平均 token
     n: int
@@ -157,6 +158,7 @@ class EvalScore:
     def as_dict(self) -> dict:
         return {"em": self.em, "f1": self.f1, "recall": self.recall,
                 "faithfulness": self.faithfulness, "correctness": self.correctness,
+                "abstain_rate": self.abstain_rate,
                 "avg_latency": self.avg_latency, "avg_tokens": self.avg_tokens, "n": self.n}
 
     def hallucination_rate(self) -> float:
@@ -178,24 +180,33 @@ class EvalScore:
 
 
 def _classify(recall: float, correct: float) -> str:
-    """recall<1 -> 檢索沒撈全; 撈到了卻答錯 -> 生成端問題。"""
+    """先看答對與否: 答對就是 ok (HotpotQA 撈到一段 gold 也常答得對)。
+    答錯才分群: recall<1 -> 檢索沒撈全; 撈全了仍答錯 -> 生成端問題。"""
+    if correct >= 1.0:
+        return "ok"
     if recall < 1.0:
         return "retrieval"
-    if correct < 1.0:
-        return "generation"
-    return "ok"
+    return "generation"
 
 
 def evaluate(cfg: RagConfig, examples: list[Example], verbose: bool = True) -> EvalScore:
     # 局部 import 避免模組載入順序問題
     from judge import judge_correctness, judge_faithfulness
 
-    em_s = f1_s = rec_s = faith_s = corr_s = lat_s = tok_s = 0.0
+    em_s = f1_s = rec_s = faith_s = corr_s = abst_s = lat_s = tok_s = 0.0
     details: list[QuestionDetail] = []
     iterator = tqdm(examples, desc=str(cfg.key()), disable=not verbose)
     for ex in iterator:
+        # judge 呼叫也要在 try 內: 一題爆 429/網路錯誤不該讓整輪評估
+        # (及已花掉的 API 成本) 全部作廢
         try:
             res = run_rag(ex.question, ex.paragraphs, cfg)
+            # verify 已算過忠實度就重用，否則補算 (確保所有配置都有此指標可比)
+            if res.faithful is not None:
+                faithful = res.faithful
+            else:
+                faithful, _ = judge_faithfulness(res.answer, res.retrieved_chunks)
+            correct, _ = judge_correctness(ex.question, res.answer, ex.answer)
         except Exception as e:  # noqa: BLE001  — 單題失敗不該中斷整輪
             if verbose:
                 tqdm.write(f"[warn] 題目失敗，記 0 分: {e}")
@@ -203,13 +214,9 @@ def evaluate(cfg: RagConfig, examples: list[Example], verbose: bool = True) -> E
         em = exact_match(res.answer, ex.answer)
         f1 = f1_score(res.answer, ex.answer)
         rec = retrieval_recall(res.retrieved_chunks, ex.gold_paragraphs)
-        # verify 已算過忠實度就重用，否則補算 (確保所有配置都有此指標可比)
-        faithful = res.faithful if res.faithful is not None \
-            else judge_faithfulness(res.answer, res.retrieved_chunks)
-        correct = judge_correctness(ex.question, res.answer, ex.answer)
 
         em_s += em; f1_s += f1; rec_s += rec; faith_s += faithful; corr_s += correct
-        lat_s += res.latency; tok_s += res.tokens
+        abst_s += float(res.abstained); lat_s += res.latency; tok_s += res.tokens
         details.append(QuestionDetail(
             question=ex.question, gold=ex.answer, pred=res.answer,
             em=em, f1=f1, recall=rec, faithful=faithful, correct=correct,
@@ -220,6 +227,7 @@ def evaluate(cfg: RagConfig, examples: list[Example], verbose: bool = True) -> E
     n = len(examples)
     return EvalScore(em=em_s / n, f1=f1_s / n, recall=rec_s / n,
                      faithfulness=faith_s / n, correctness=corr_s / n,
+                     abstain_rate=abst_s / n,
                      avg_latency=lat_s / n, avg_tokens=tok_s / n,
                      n=n, details=details)
 
@@ -237,4 +245,5 @@ if __name__ == "__main__":
     print(f"  recall       = {score.recall:.3f}")
     print(f"  correctness  = {score.correctness:.3f} (LLM judge)")
     print(f"  faithfulness = {score.faithfulness:.3f} (幻覺率 {score.hallucination_rate():.3f})")
+    print(f"  abstain rate = {score.abstain_rate:.3f} (守門員棄答比例)")
     print(f"  cost         = {score.avg_latency:.2f}s, {score.avg_tokens:.0f} tok/題")

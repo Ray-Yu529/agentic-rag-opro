@@ -16,7 +16,7 @@ from tqdm import tqdm
 
 from rag import RagConfig
 from eval import load_hotpot
-from cache import ResultCache
+from cache import ResultCache, dataset_key
 from optimizer import SEARCH_SPACE, objective
 
 load_dotenv()
@@ -31,7 +31,7 @@ def base_grid() -> list[RagConfig]:
 
 def main(n: int = 30, n_hard: int = 15) -> None:
     examples = load_hotpot(n=n, n_hard=n_hard)
-    cache = ResultCache()
+    cache = ResultCache(dataset=dataset_key(n, n_hard))
     configs = base_grid()
     print(f"載入 {len(examples)} 題，掃描核心網格 {len(configs)} 組 (agentic 全關)\n")
 
@@ -43,7 +43,7 @@ def main(n: int = 30, n_hard: int = 15) -> None:
     ranked = sorted(records, key=lambda r: r["score"]["correctness"], reverse=True)
     best, worst = ranked[0], ranked[-1]
     gap = best["score"]["correctness"] - worst["score"]["correctness"]
-    print(f"\n已存 cache ({len(cache.store)} 組)")
+    print(f"\n已存 cache (本測試集 {len(cache.all_records())} 組)")
     print("\n========== D2.5 go/no-go ==========")
     print(f"最佳 correctness = {best['score']['correctness']:.3f}  @ {best['config']}")
     print(f"最差 correctness = {worst['score']['correctness']:.3f}  @ {worst['config']}")

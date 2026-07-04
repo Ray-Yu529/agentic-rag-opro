@@ -13,14 +13,12 @@ hybrid.py — 混合最佳化: LLM 縮範圍 -> Optuna 在範圍內收斂
 
 from __future__ import annotations
 
-import json
-import re
 import random
 
-from rag import RagConfig, get_client
+from rag import RagConfig
 from cache import ResultCache, config_to_dict
 from memory.trajectory import Trajectory
-from optimizer import (SEARCH_SPACE, all_configs, objective, _trial, META_MODEL,
+from optimizer import (SEARCH_SPACE, all_configs, chat_json, objective, _trial,
                        _make_say)
 
 
@@ -43,18 +41,7 @@ def _ask_region(traj: Trajectory) -> dict:
 請判斷哪些值得繼續搜，把每個維度限縮成「值得搜的子集」(可只留 1~2 個值)，砍掉看起來沒用的。
 只輸出 JSON: {{"reasoning":"...", "region":{{"chunk_size":[...],"top_k":[...],"retriever":[...],"rerank":[...],"query_decompose":[...],"verify":[...]}}}}"""
 
-    client = get_client()
-    resp = client.chat.completions.create(
-        model=META_MODEL, messages=[{"role": "user", "content": prompt}],
-        temperature=0.3, max_tokens=600,
-    )
-    m = re.search(r"\{.*\}", resp.choices[0].message.content, re.DOTALL)
-    region = {}
-    if m:
-        try:
-            region = json.loads(m.group(0)).get("region", {})
-        except json.JSONDecodeError:
-            pass
+    region = chat_json(prompt, temperature=0.3, max_tokens=600).get("region", {})
     # 清洗: 子集必須 ⊆ 合法值，否則該維度退回全集
     clean = {}
     for dim, allowed in SEARCH_SPACE.items():
