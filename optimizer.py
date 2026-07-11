@@ -29,6 +29,7 @@ from memory.trajectory import Trajectory, Trial
 # meta-optimizer (推理量小)；端點不穩時可在 .env 用 META_MODEL 覆寫
 META_MODEL = os.environ.get("META_MODEL", "nvidia/llama-3.1-nemotron-70b-instruct")
 DEFAULT_LAMBDA = 0.5  # 幻覺懲罰權重預設值 (各 search 函式可用 lam 參數覆寫)
+DEFAULT_MU = 0.0      # 成本懲罰權重: objective -= μ × (每題平均 token / 1000)
 
 
 def chat_json(prompt: str, temperature: float, max_tokens: int,
@@ -78,17 +79,19 @@ def is_valid(d: dict) -> bool:
         return False
 
 
-def objective(score: dict, lam: float = DEFAULT_LAMBDA) -> float:
-    """多目標純量化: 正確率 - λ·幻覺率。"""
+def objective(score: dict, lam: float = DEFAULT_LAMBDA,
+              mu: float = DEFAULT_MU) -> float:
+    """多目標純量化: 正確率 - λ·幻覺率 - μ·成本 (每題 ktok)。μ=0 時同舊版。"""
     hallucination = 1.0 - score.get("faithfulness", 1.0)
-    return score.get("correctness", 0.0) - lam * hallucination
+    cost = score.get("avg_tokens", 0.0) / 1000.0
+    return score.get("correctness", 0.0) - lam * hallucination - mu * cost
 
 
-def _trial(record: dict, source: str, lam: float) -> Trial:
+def _trial(record: dict, source: str, lam: float, mu: float = DEFAULT_MU) -> Trial:
     return Trial(config=record["config"], score=record["score"],
-                 objective=objective(record["score"], lam),
+                 objective=objective(record["score"], lam, mu),
                  failures=record["failures"], source=source,
-                 lam=lam)  # 記下當時的 λ，避免不同權重的軌跡混著比
+                 lam=lam, mu=mu)  # 記下當時的權重，避免不同權重的軌跡混著比
 
 
 def _make_say(log_fn, verbose):
@@ -98,10 +101,37 @@ def _make_say(log_fn, verbose):
     return print if verbose else (lambda *_: None)
 
 
+def _incumbent(traj: Trajectory) -> float | None:
+    """racing 的門檻: 目前最佳 objective (無試驗時不啟用剪枝)。"""
+    b = traj.best()
+    return b.objective if b else None
+
+
+def _race_note(rec: dict) -> str:
+    return f" (racing 提早停止 @{rec['score'].get('n', '?')} 題)" if rec.get("pruned") else ""
+
+
+def _warm_init(grid: list[RagConfig], warm_configs,
+               n_init: int) -> tuple[list[RagConfig], int]:
+    """暖身清單: warm-start 建議 (合法且去重，最多 n_init-1 組，至少留 1 格隨機
+    避免全吃舊經驗) + 同 seed 隨機組補滿。回傳 (清單, warm 組數)。"""
+    warm: list[RagConfig] = []
+    for d in (warm_configs or []):
+        if not is_valid(d):
+            continue
+        cfg = _config_from_proposal(d)
+        if all(cfg.key() != w.key() for w in warm):
+            warm.append(cfg)
+    warm = warm[:max(0, n_init - 1)]
+    used = {w.key() for w in warm}
+    fill = [c for c in grid if c.key() not in used][:n_init - len(warm)]
+    return warm + fill, len(warm)
+
+
 # --- D3: Random search baseline -------------------------------------------
 def random_search(examples, cache: ResultCache, budget: int, seed: int,
                   traj_path: str, verbose: bool = True, log_fn=None,
-                  lam: float = DEFAULT_LAMBDA) -> Trajectory:
+                  lam: float = DEFAULT_LAMBDA, mu: float = DEFAULT_MU) -> Trajectory:
     say = _make_say(log_fn, verbose)
     rng = random.Random(seed)
     grid = all_configs()
@@ -109,9 +139,11 @@ def random_search(examples, cache: ResultCache, budget: int, seed: int,
     traj = Trajectory(traj_path)
     traj.reset()
     for cfg in grid[:budget]:
-        rec = cache.evaluate_cached(cfg, examples, verbose=verbose)
-        traj.add(_trial(rec, source="random", lam=lam))
-        say(f"[random] 評估 {config_to_dict(cfg)} -> obj={objective(rec['score'], lam):.3f}")
+        rec = cache.evaluate_cached(cfg, examples, verbose=verbose,
+                                    prune_below=_incumbent(traj), prune_lam=lam)
+        traj.add(_trial(rec, source="random", lam=lam, mu=mu))
+        say(f"[random] 評估 {config_to_dict(cfg)} -> "
+            f"obj={objective(rec['score'], lam, mu):.3f}{_race_note(rec)}")
     return traj
 
 
@@ -131,11 +163,13 @@ def _marginal_lines(traj: Trajectory) -> str:
 
 
 def _build_meta_prompt(traj: Trajectory, cache: ResultCache,
-                       lam: float = DEFAULT_LAMBDA) -> str:
+                       lam: float = DEFAULT_LAMBDA,
+                       mu: float = DEFAULT_MU) -> str:
     ranked = sorted(traj.trials, key=lambda t: t.objective, reverse=True)
     lines = []
     for rank, t in enumerate(ranked, 1):
         c, s = t.config, t.score
+        pruned = " [提早停止:確定劣於當時最佳]" if s.get("pruned") else ""
         lines.append(
             f"  #{rank} chunk={c['chunk_size']}, top_k={c['top_k']}, ret={c['retriever']:6s}, "
             f"rerank={int(c['rerank'])}, decomp={int(c['query_decompose'])}, "
@@ -143,7 +177,7 @@ def _build_meta_prompt(traj: Trajectory, cache: ResultCache,
             f"-> 正確率={s['correctness']:.2f}, 幻覺率={1-s['faithfulness']:.2f}, "
             f"棄答率={s.get('abstain_rate', 0):.2f}, "
             f"recall={s['recall']:.2f}, obj={t.objective:.3f}, "
-            f"成本={s['avg_latency']:.1f}s/{s['avg_tokens']:.0f}tok"
+            f"成本={s['avg_latency']:.1f}s/{s['avg_tokens']:.0f}tok{pruned}"
         )
     table = "\n".join(lines)
 
@@ -164,7 +198,8 @@ def _build_meta_prompt(traj: Trajectory, cache: ResultCache,
     tried = ", ".join(sorted(
         "|".join(str(t.config[k]) for k in SEARCH_SPACE) for t in traj.trials))
 
-    return f"""你是 RAG 系統最佳化架構師。目標: 最大化 objective = 正確率 - {lam}×幻覺率。
+    obj_desc = f"正確率 - {lam}×幻覺率" + (f" - {mu}×每題成本(ktok)" if mu else "")
+    return f"""你是 RAG 系統最佳化架構師。目標: 最大化 objective = {obj_desc}。
 
 合法參數值 (提案必須從這裡選):
   chunk_size      ∈ {SEARCH_SPACE['chunk_size']}
@@ -234,7 +269,8 @@ def _random_untried(tried: set[tuple], rng: random.Random) -> RagConfig | None:
 
 def opro_search(examples, cache: ResultCache, budget: int, seed: int, traj_path: str,
                 n_init: int = 3, verbose: bool = True, log_fn=None,
-                lam: float = DEFAULT_LAMBDA) -> Trajectory:
+                lam: float = DEFAULT_LAMBDA, mu: float = DEFAULT_MU,
+                warm_configs: list[dict] | None = None) -> Trajectory:
     say = _make_say(log_fn, verbose)
     rng = random.Random(seed)
     grid = all_configs()
@@ -243,14 +279,18 @@ def opro_search(examples, cache: ResultCache, budget: int, seed: int, traj_path:
     traj = Trajectory(traj_path)
     traj.reset()
 
-    # 暖身: 與 random baseline 相同 seed 的前 n_init 組 (公平起跑)
-    for cfg in grid[:n_init]:
-        rec = cache.evaluate_cached(cfg, examples, verbose=verbose)
-        traj.add(_trial(rec, source="init", lam=lam))
-        say(f"[暖身] {config_to_dict(cfg)} -> obj={objective(rec['score'], lam):.3f}")
+    # 暖身: 預設與 random baseline 相同 seed 的前 n_init 組 (公平起跑)；
+    # 有 warm-start 建議時取代部分暖身組 (會破壞與 random 的公平對照，須明示開啟)
+    init_list, n_warm = _warm_init(grid, warm_configs, n_init)
+    for i, cfg in enumerate(init_list):
+        rec = cache.evaluate_cached(cfg, examples, verbose=verbose,
+                                    prune_below=_incumbent(traj), prune_lam=lam)
+        traj.add(_trial(rec, source="init", lam=lam, mu=mu))
+        say(f"[{'warm-start' if i < n_warm else '暖身'}] {config_to_dict(cfg)} -> "
+            f"obj={objective(rec['score'], lam, mu):.3f}{_race_note(rec)}")
 
     while len(traj.trials) < budget:
-        result = _call_meta(_build_meta_prompt(traj, cache, lam))
+        result = _call_meta(_build_meta_prompt(traj, cache, lam, mu))
         say(f"\n[OPRO 第 {len(traj.trials) - n_init + 1} 輪] 推理: "
             f"{result.get('reasoning', '')}")
         tried = traj.tried_keys()
@@ -266,8 +306,9 @@ def opro_search(examples, cache: ResultCache, budget: int, seed: int, traj_path:
             if len(traj.trials) >= budget:
                 break
             say(f"  -> 採用 {config_to_dict(cfg)}")
-            rec = cache.evaluate_cached(cfg, examples, verbose=verbose)
-            traj.add(_trial(rec, source="opro", lam=lam))
-            say(f"  -> obj={objective(rec['score'], lam):.3f}")
+            rec = cache.evaluate_cached(cfg, examples, verbose=verbose,
+                                        prune_below=_incumbent(traj), prune_lam=lam)
+            traj.add(_trial(rec, source="opro", lam=lam, mu=mu))
+            say(f"  -> obj={objective(rec['score'], lam, mu):.3f}{_race_note(rec)}")
 
     return traj

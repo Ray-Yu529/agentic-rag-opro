@@ -19,12 +19,30 @@ export default function ConfigForm({ params, setParams, onRun, running }) {
 
   const isCustom = params.dataset_mode === "custom";
 
-  // 多個 .txt/.md 檔在瀏覽器端讀成文字，串成一份語料 (後端以空行分段)
+  // .txt/.md 在瀏覽器端讀成文字；.pdf 轉 base64 由後端抽取 (文字層優先，掃描頁走 VLM)
   const onCorpusFiles = async (e) => {
     const files = [...e.target.files];
     if (files.length === 0) return;
-    const texts = await Promise.all(files.map((f) => f.text()));
-    setParams({ ...params, corpus_text: texts.join("\n\n") });
+    const texts = [];
+    const pdfs = [];
+    for (const f of files) {
+      if (f.name.toLowerCase().endsWith(".pdf")) {
+        const buf = new Uint8Array(await f.arrayBuffer());
+        let bin = "";
+        const CHUNK = 0x8000;
+        for (let i = 0; i < buf.length; i += CHUNK) {
+          bin += String.fromCharCode(...buf.subarray(i, i + CHUNK));
+        }
+        pdfs.push({ name: f.name, b64: btoa(bin) });
+      } else {
+        texts.push(await f.text());
+      }
+    }
+    setParams({
+      ...params,
+      corpus_text: texts.join("\n\n"),
+      corpus_pdfs: pdfs.length ? pdfs : null,
+    });
   };
 
   // QA 檔: jsonl (每行一筆) 或 json array
@@ -55,9 +73,10 @@ export default function ConfigForm({ params, setParams, onRun, running }) {
     if (src === "generate") setParams({ ...params, qa: null });
   };
 
+  const hasCorpus = !!params.corpus_text.trim() ||
+                    (params.corpus_pdfs && params.corpus_pdfs.length > 0);
   const customNotReady =
-    isCustom && (!params.corpus_text.trim() ||
-                 (qaSource === "upload" && !params.qa));
+    isCustom && (!hasCorpus || (qaSource === "upload" && !params.qa));
 
   return (
     <div className="card">
@@ -79,15 +98,18 @@ export default function ConfigForm({ params, setParams, onRun, running }) {
 
       {isCustom && (
         <>
-          <label>文件（.txt / .md，可多選）</label>
-          <input type="file" multiple accept=".txt,.md,text/plain,text/markdown"
+          <label>文件（.txt / .md / .pdf，可多選）</label>
+          <input type="file" multiple accept=".txt,.md,.pdf,text/plain,text/markdown"
                  onChange={onCorpusFiles} disabled={running} />
           <label>或直接貼上內容（空行分段）</label>
           <textarea rows={5} value={params.corpus_text}
                     onChange={set("corpus_text")} disabled={running}
                     placeholder="貼上你的文件內容…" />
-          {params.corpus_text.trim() && (
-            <p className="hint">語料 ≈ {params.corpus_text.length} 字元</p>
+          {hasCorpus && (
+            <p className="hint">
+              語料 ≈ {params.corpus_text.length} 字元
+              {params.corpus_pdfs && ` + ${params.corpus_pdfs.length} 個 PDF`}
+            </p>
           )}
 
           <label>QA 來源</label>
@@ -111,6 +133,13 @@ export default function ConfigForm({ params, setParams, onRun, running }) {
               </p>
               {qaError && <p className="error">{qaError}</p>}
             </>
+          )}
+          {qaSource === "generate" && (
+            <label className="check-row">
+              <input type="checkbox" checked={params.multihop} disabled={running}
+                     onChange={(e) => setParams({ ...params, multihop: e.target.checked })} />
+              包含跨段落多跳題（query_decompose 才有東西可學）
+            </label>
           )}
         </>
       )}
@@ -148,7 +177,20 @@ export default function ConfigForm({ params, setParams, onRun, running }) {
       <label>幻覺懲罰權重 λ：{params.lam}</label>
       <input type="range" min="0" max="1" step="0.1" value={params.lam}
              onChange={set("lam")} disabled={running} />
-      <p className="hint">objective = 正確率 − {params.lam} × 幻覺率</p>
+
+      <label>成本懲罰權重 μ：{params.mu}</label>
+      <input type="range" min="0" max="0.3" step="0.05" value={params.mu}
+             onChange={set("mu")} disabled={running} />
+      <p className="hint">
+        objective = 正確率 − {params.lam}×幻覺率
+        {params.mu > 0 && ` − ${params.mu}×每題成本(ktok)`}
+      </p>
+
+      <label className="check-row">
+        <input type="checkbox" checked={params.warmstart} disabled={running}
+               onChange={(e) => setParams({ ...params, warmstart: e.target.checked })} />
+        warm-start（OPRO/Hybrid 用過去 run 的最佳配置暖身；對照實驗別開）
+      </label>
 
       <button className="run-btn" onClick={onRun}
               disabled={running || customNotReady}>

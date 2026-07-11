@@ -13,23 +13,29 @@ server.py — FastAPI 後端: 把 optimizer 包成 API 給 React 前端用
 
 from __future__ import annotations
 
+import base64
 import hashlib
+import html
+import json
 import threading
+import time
 from functools import lru_cache
 from pathlib import Path
 
 from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
 from eval import load_hotpot
 from cache import DEFAULT_DATASET, ResultCache, dataset_key, custom_dataset_key
 from dataset import (split_paragraphs, generate_qa, validate_qa, save_qa,
                      load_qa, build_examples, dataset_fingerprint,
-                     MAX_PARAGRAPHS)
-from optimizer import DEFAULT_LAMBDA, random_search, opro_search
+                     extract_pdf_text, MAX_PARAGRAPHS)
+from optimizer import DEFAULT_LAMBDA, DEFAULT_MU, random_search, opro_search
 from hybrid import hybrid_search
+from memory import warmstart
 from memory.trajectory import Trajectory
 from pareto import pareto_front
 
@@ -37,6 +43,7 @@ load_dotenv()
 
 RESULTS = Path(__file__).parent / "results"
 DATA = Path(__file__).parent / "data"      # 自訂語料/生成 QA 的落地目錄
+HISTORY = RESULTS / "history.jsonl"        # 每次 run 的摘要 (History 面板/報告用)
 app = FastAPI(title="Agentic RAG + OPRO")
 app.add_middleware(
     CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"],
@@ -45,7 +52,7 @@ app.add_middleware(
 # --- 全域任務狀態 (Demo: 一次跑一個) --------------------------------------
 STATE: dict = {"running": False, "strategy": None, "done": 0, "total": 0,
                "log": [], "error": None, "dataset": DEFAULT_DATASET,
-               "lam": DEFAULT_LAMBDA}
+               "lam": DEFAULT_LAMBDA, "mu": DEFAULT_MU, "run_id": None}
 _lock = threading.Lock()
 
 
@@ -61,9 +68,13 @@ class RunReq(BaseModel):
     n_hard: int = 10            # hotpot 專用; custom 模式忽略
     budget: int = 8             # 評估次數
     lam: float = 0.5            # 幻覺懲罰權重
+    mu: float = 0.0             # 成本懲罰權重 (objective -= μ×每題ktok)
     dataset_mode: str = "hotpot"        # hotpot | custom
     corpus_text: str = ""               # custom: 文件全文 (前端已把多檔串好)
+    corpus_pdfs: list[dict] | None = None  # custom: PDF 檔 [{name, b64}]
     qa: list[dict] | None = None        # custom: 自備 QA; None -> 用 LLM 生成 n 題
+    multihop: bool = False              # custom+生成: 約一半生成跨段落多跳題
+    warmstart: bool = False             # OPRO/hybrid 用過去相似資料集的配置暖身
 
 
 def _log(msg: str) -> None:
@@ -73,12 +84,18 @@ def _log(msg: str) -> None:
 
 
 def _prepare_custom(req: RunReq) -> tuple[list, str]:
-    """自訂資料集: 語料切段 -> (自備 / LLM 生成) QA -> Example。
+    """自訂資料集: (PDF 抽取 +) 語料切段 -> (自備 / LLM 生成) QA -> Example。
     生成的 QA 落地 data/<語料hash>/，同語料同題數之後直接重用不再花 API。"""
-    paragraphs = split_paragraphs(req.corpus_text)
+    corpus_text = req.corpus_text
+    for f in (req.corpus_pdfs or []):
+        _log(f"解析 PDF: {f.get('name', '?')} (文字層優先，掃描頁走 VLM)")
+        corpus_text += "\n\n" + extract_pdf_text(
+            base64.b64decode(f["b64"]), log_fn=_log)
+
+    paragraphs = split_paragraphs(corpus_text)
     if not paragraphs:
         raise ValueError(
-            "語料是空的: 請上傳/貼上 .txt 或 .md 內容 (空行分段，段落 ≥30 字元)")
+            "語料是空的: 請上傳/貼上 .txt/.md/.pdf 內容 (空行分段，段落 ≥30 字元)")
     if len(paragraphs) > MAX_PARAGRAPHS:
         raise ValueError(
             f"語料 {len(paragraphs)} 段超過上限 {MAX_PARAGRAPHS} 段，請先抽一個子集")
@@ -87,17 +104,19 @@ def _prepare_custom(req: RunReq) -> tuple[list, str]:
         qa = validate_qa(req.qa)
         _log(f"使用自備 QA {len(qa)} 題")
     else:
-        corpus_id = hashlib.sha1(req.corpus_text.encode("utf-8")).hexdigest()[:10]
+        corpus_id = hashlib.sha1(corpus_text.encode("utf-8")).hexdigest()[:10]
         ddir = DATA / corpus_id
-        qa_path = ddir / f"qa_gen_n{req.n}_seed42.jsonl"
+        mh = "_mh" if req.multihop else ""
+        qa_path = ddir / f"qa_gen_n{req.n}_seed42{mh}.jsonl"
         if qa_path.exists():
             qa = load_qa(qa_path)
             _log(f"重用先前生成的 QA ({len(qa)} 題)")
         else:
             _log(f"用 LLM 生成 {req.n} 題 QA 中… (每題約 1 次 API 呼叫)")
-            qa = generate_qa(paragraphs, n=req.n, seed=42, log_fn=_log)
+            qa = generate_qa(paragraphs, n=req.n, seed=42, log_fn=_log,
+                             multihop=req.multihop)
             ddir.mkdir(parents=True, exist_ok=True)
-            (ddir / "corpus.txt").write_text(req.corpus_text, encoding="utf-8")
+            (ddir / "corpus.txt").write_text(corpus_text, encoding="utf-8")
             save_qa(qa, qa_path)
             _log("QA 已存檔 (data/)，同語料同題數之後直接重用")
 
@@ -121,16 +140,29 @@ def _job(req: RunReq) -> None:
             STATE["dataset"] = dkey   # /api/results 的 Pareto 以此取同一批 record
         cache = ResultCache(dataset=dkey)
         traj_path = str(RESULTS / f"{req.strategy}.jsonl")
-        # λ 以參數傳入 (不動全域狀態)，且會記進每筆 Trial
+
+        feats = warmstart.dataset_features(examples)
+        warm = None
+        if req.warmstart:
+            warm = warmstart.suggest(feats, k=2, exclude_dataset=dkey) or None
+            _log(f"warm-start 建議: {warm or '無 (記憶庫還是空的)'}")
+
+        # λ/μ 以參數傳入 (不動全域狀態)，且會記進每筆 Trial
         common = dict(examples=examples, cache=cache, budget=req.budget,
                       seed=42, traj_path=traj_path, verbose=False, log_fn=_log,
-                      lam=req.lam)
+                      lam=req.lam, mu=req.mu)
         if req.strategy == "random":
-            random_search(**common)
+            traj = random_search(**common)
         elif req.strategy == "hybrid":
-            hybrid_search(n_init=3, **common)
+            traj = hybrid_search(n_init=3, warm_configs=warm, **common)
         else:
-            opro_search(n_init=3, **common)
+            traj = opro_search(n_init=3, warm_configs=warm, **common)
+
+        # 跨 run 經驗記憶 + History 摘要 (報告/歷史面板用)
+        best = traj.best()
+        if best is not None:
+            warmstart.record(dkey, feats, best.config, best.objective)
+            _append_history(req, dkey, traj)
         _log("✅ 完成")
     except Exception as e:  # noqa: BLE001 — 回報給前端而非崩潰
         with _lock:
@@ -139,6 +171,32 @@ def _job(req: RunReq) -> None:
     finally:
         with _lock:
             STATE["running"] = False
+
+
+def _append_history(req: RunReq, dkey: str, traj) -> None:
+    """把一次 run 的摘要 (參數/最佳配置/全部試驗/推理 log) 追加到 history.jsonl。"""
+    b = traj.best()
+    with _lock:
+        run_id = STATE["run_id"]
+        log_snapshot = list(STATE["log"])
+    row = {
+        "run_id": run_id,
+        "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "strategy": req.strategy,
+        "params": {"n": req.n, "n_hard": req.n_hard, "budget": req.budget,
+                   "lam": req.lam, "mu": req.mu,
+                   "dataset_mode": req.dataset_mode, "multihop": req.multihop,
+                   "warmstart": req.warmstart},
+        "dataset": dkey,
+        "best": {"config": b.config, "score": b.score, "objective": b.objective},
+        "trials": [{"config": t.config, "score": t.score,
+                    "objective": t.objective, "source": t.source}
+                   for t in traj.trials],
+        "log": log_snapshot,
+    }
+    RESULTS.mkdir(parents=True, exist_ok=True)
+    with HISTORY.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
 @app.post("/api/run")
@@ -151,7 +209,8 @@ def run(req: RunReq):
                      # custom 的 key 要等 QA 就緒才算得出來，先放占位符由 _job 更新
                      dataset=("custom|pending" if req.dataset_mode == "custom"
                               else dataset_key(req.n, min(req.n_hard, req.n))),
-                     lam=req.lam)
+                     lam=req.lam, mu=req.mu,
+                     run_id=time.strftime("%Y%m%d-%H%M%S"))
     threading.Thread(target=_job, args=(req,), daemon=True).start()
     return {"ok": True}
 
@@ -195,6 +254,7 @@ def results():
     with _lock:
         dataset = STATE["dataset"]
         lam = STATE["lam"]
+        mu = STATE["mu"]
     cache = ResultCache(dataset=dataset)
     pts = [{"key": r["config"], "hallucination": 1 - r["score"]["faithfulness"],
             "correctness": r["score"]["correctness"]} for r in cache.all_records()]
@@ -204,7 +264,76 @@ def results():
                    key=lambda p: (p["hallucination"], -p["correctness"]))
     return {"strategies": strategies, "best": overall_best,
             "pareto": {"points": pts, "front": front},
-            "lam": lam}
+            "lam": lam, "mu": mu}
+
+
+def _history_rows() -> list[dict]:
+    if not HISTORY.exists():
+        return []
+    return [json.loads(ln) for ln in HISTORY.read_text(encoding="utf-8").splitlines()
+            if ln.strip()]
+
+
+@app.get("/api/history")
+def history():
+    """過去 run 的摘要 (新的在前)，History 面板用。不含 trials/log (太大)。"""
+    rows = _history_rows()
+    slim = [{k: r[k] for k in ("run_id", "ts", "strategy", "params",
+                               "dataset", "best")} for r in rows]
+    return {"runs": slim[::-1]}
+
+
+def _esc(v) -> str:
+    return html.escape(str(v))
+
+
+@app.get("/api/report/{run_id}", response_class=HTMLResponse)
+def report(run_id: str):
+    """單次 run 的自包含 HTML 報告: 參數、最佳配置、全部試驗、推理軌跡。
+    可直接存檔交付 (「為什麼選這組參數」的可稽核紀錄)。"""
+    row = next((r for r in _history_rows() if r["run_id"] == run_id), None)
+    if row is None:
+        return HTMLResponse(f"<h1>找不到 run {_esc(run_id)}</h1>", status_code=404)
+
+    b = row["best"]
+    cfg_rows = "".join(
+        f"<tr><td>{_esc(k)}</td><td><b>{_esc(v)}</b></td></tr>"
+        for k, v in b["config"].items())
+    param_rows = "".join(
+        f"<tr><td>{_esc(k)}</td><td>{_esc(v)}</td></tr>"
+        for k, v in row["params"].items())
+    trial_rows = "".join(
+        "<tr><td>{}</td><td>{}</td><td>{:.0%}</td><td>{:.0%}</td><td>{:.3f}</td></tr>".format(
+            _esc(t["source"]),
+            _esc(", ".join(f"{k}={v}" for k, v in t["config"].items()
+                           if k != "chunk_overlap")),
+            t["score"].get("correctness", 0), 1 - t["score"].get("faithfulness", 1),
+            t["objective"])
+        for t in sorted(row["trials"], key=lambda t: -t["objective"]))
+    log_html = "<br>".join(_esc(ln) for ln in row["log"])
+
+    return HTMLResponse(f"""<!doctype html><html lang="zh-Hant"><head>
+<meta charset="utf-8"><title>Run 報告 {_esc(run_id)}</title>
+<style>
+ body{{font-family:system-ui,'Microsoft JhengHei',sans-serif;max-width:920px;
+      margin:2rem auto;padding:0 1rem;color:#222}}
+ table{{border-collapse:collapse;margin:.5rem 0 1.5rem}}
+ td,th{{border:1px solid #ccc;padding:.3rem .7rem;font-size:.9rem}}
+ th{{background:#f2f2f2}} .log{{background:#f8f8f8;border:1px solid #ddd;
+ padding:1rem;font-size:.82rem;line-height:1.5}}
+</style></head><body>
+<h1>Agentic RAG + OPRO — Run 報告</h1>
+<p>{_esc(row['ts'])} · 策略 <b>{_esc(row['strategy'])}</b> · run_id {_esc(run_id)}<br>
+測試集: {_esc(row['dataset'])}</p>
+<h2>參數</h2><table>{param_rows}</table>
+<h2>勝出配置 (objective={b['objective']:.3f}，正確率 {b['score'].get('correctness', 0):.0%}，
+幻覺率 {1 - b['score'].get('faithfulness', 1):.0%})</h2>
+<table>{cfg_rows}</table>
+<h2>全部試驗 (依 objective)</h2>
+<table><tr><th>來源</th><th>配置</th><th>正確率</th><th>幻覺率</th><th>obj</th></tr>
+{trial_rows}</table>
+<h2>執行/推理軌跡</h2><div class="log">{log_html}</div>
+</body></html>""")
 
 
 if __name__ == "__main__":

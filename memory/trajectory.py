@@ -26,6 +26,7 @@ class Trial:
     failures: list[dict] = field(default_factory=list)
     source: str = "init"              # "init" | "random" | "opro" | "hybrid"
     lam: float | None = None          # 計算 objective 時用的 λ
+    mu: float | None = None           # 計算 objective 時用的 μ (成本懲罰；舊軌跡為 None)
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), ensure_ascii=False)

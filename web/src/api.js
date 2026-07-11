@@ -18,3 +18,8 @@ export async function getResults() {
   const r = await fetch("/api/results");
   return r.json();
 }
+
+export async function getHistory() {
+  const r = await fetch("/api/history");
+  return r.json();
+}

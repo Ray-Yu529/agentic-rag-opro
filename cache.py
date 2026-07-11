@@ -20,7 +20,7 @@ import hashlib
 import json
 from pathlib import Path
 
-from rag import RagConfig, GEN_MODEL, EMBED_MODEL, SYSTEM_PROMPT
+from rag import RagConfig, GEN_MODEL, EMBED_MODEL, RERANK_MODEL, SYSTEM_PROMPT
 from judge import JUDGE_MODEL
 
 CACHE_PATH = Path(__file__).parent / "cache.json"
@@ -29,14 +29,14 @@ _FIELDS = ("chunk_size", "top_k", "retriever", "chunk_overlap",
            "rerank", "query_decompose", "verify")
 
 # 評估邏輯/指標「語意」改動時手動 +1 (例如改判官 prompt、改 recall 定義)，
-# 讓舊 cache 全部失效。
-EVAL_VERSION = 2
+# 讓舊 cache 全部失效。v3: CJK 正規化/字元級 F1 + 專用 reranker。
+EVAL_VERSION = 3
 
 
 def _eval_fingerprint() -> str:
     """模型 + prompt 版本指紋: 換模型或改 prompt 後，舊分數不可沿用。"""
     blob = "|".join([str(EVAL_VERSION), GEN_MODEL, EMBED_MODEL,
-                     JUDGE_MODEL, SYSTEM_PROMPT])
+                     RERANK_MODEL, JUDGE_MODEL, SYSTEM_PROMPT])
     return hashlib.sha1(blob.encode("utf-8")).hexdigest()[:8]
 
 
@@ -62,8 +62,19 @@ def dict_to_config(d: dict) -> RagConfig:
     return RagConfig(**{f: d[f] for f in _FIELDS if f in d})
 
 
+def _canonical(d: dict) -> dict:
+    """等價配置正規化: RERANK_MODEL=dense 時，dense 檢索＋無分解的 rerank
+    是恆等變換 (同一分數函數重排)，映射到 rerank=False 共用同一筆快取分數。
+    (預設用專用 reranker 模型時兩者真的不同，不做正規化。)"""
+    if (RERANK_MODEL == "dense" and d.get("retriever") == "dense"
+            and not d.get("query_decompose") and d.get("rerank")):
+        return dict(d, rerank=False)
+    return d
+
+
 def config_key(cfg_or_dict) -> str:
     d = config_to_dict(cfg_or_dict) if isinstance(cfg_or_dict, RagConfig) else cfg_or_dict
+    d = _canonical(d)
     return "|".join(str(d[f]) for f in _FIELDS)
 
 
@@ -89,14 +100,25 @@ class ResultCache:
             json.dumps(self.store, ensure_ascii=False, indent=2), encoding="utf-8")
         tmp.replace(self.path)
 
-    def evaluate_cached(self, cfg: RagConfig, examples, verbose: bool = False) -> dict:
+    def evaluate_cached(self, cfg: RagConfig, examples, verbose: bool = False,
+                        prune_below: float | None = None,
+                        prune_lam: float = 0.5) -> dict:
         """回傳該配置的完整 record (命中快取則不呼叫 API)。
-        評估失敗題過多時 evaluate 會拋出 -> 不落 cache (避免壞分數被永久快取)。"""
+        評估失敗題過多時 evaluate 會拋出 -> 不落 cache (避免壞分數被永久快取)。
+        prune_below 啟用 racing: 提早停止的配置回傳帶 pruned 標記的輕量 record，
+        同樣不落 cache (沒有完整分數)。"""
         hit = self.get(cfg)
         if hit is not None:
             return hit
-        from eval import evaluate  # 局部 import，避免載入順序問題
-        score = evaluate(cfg, examples, verbose=verbose)
+        from eval import evaluate, EvalPruned  # 局部 import，避免載入順序問題
+        try:
+            score = evaluate(cfg, examples, verbose=verbose,
+                             prune_below=prune_below, prune_lam=prune_lam)
+        except EvalPruned as p:
+            return {"config": config_to_dict(cfg), "score": p.partial_score,
+                    "pruned": True, "bound": p.bound,
+                    "failures": [], "fail_clusters": {},
+                    "per_question_correct": {}}
         record = {
             "config": config_to_dict(cfg),
             "score": score.as_dict(),

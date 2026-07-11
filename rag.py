@@ -22,6 +22,7 @@ from dataclasses import dataclass, field, replace
 from functools import lru_cache
 
 import numpy as np
+import requests
 from dotenv import load_dotenv
 from openai import (APIConnectionError, APITimeoutError, InternalServerError,
                     OpenAI, RateLimitError)
@@ -33,18 +34,29 @@ load_dotenv()  # 先讀 .env，下面模型 id 的環境變數覆寫才吃得到
 NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
 # 模型 id 可用環境變數覆寫 (端點 404/不穩時換模型，或換私有 OpenAI 相容端點)
 GEN_MODEL = os.environ.get("GEN_MODEL", "meta/llama-3.1-8b-instruct")     # generator (便宜、量大)
-EMBED_MODEL = os.environ.get("EMBED_MODEL", "nvidia/llama-3.2-nv-embedqa-1b-v2")  # dense 檢索 / rerank
+EMBED_MODEL = os.environ.get("EMBED_MODEL", "nvidia/llama-3.2-nv-embedqa-1b-v2")  # dense 檢索
+# rerank 用專用 reranker 模型 (dense-cosine 重排在 dense 檢索下是恆等變換，
+# rerank 開關會學不到東西)。設 RERANK_MODEL=dense 可退回舊行為；端點失效自動 fallback。
+RERANK_MODEL = os.environ.get("RERANK_MODEL", "nvidia/llama-3.2-nv-rerankqa-1b-v2")
+RERANK_URL = os.environ.get(
+    "RERANK_URL",
+    "https://ai.api.nvidia.com/v1/retrieval/nvidia/llama-3_2-nv-rerankqa-1b-v2/reranking")
 # 註: model id 請到 build.nvidia.com 對最新清單; 介面是 OpenAI 相容的。
 
 ABSTAIN = "I don't have enough evidence to answer."
 
 # 生成器在 context 不足時會自行棄答 (SYSTEM_PROMPT 有指示)。不論 verify 開關，
 # 棄答式回答都必須按同一規則計分 (見 eval.py)，否則 objective 會隱性補貼 verify。
+# 中文語料下生成器常用中文棄答，pattern 必須雙語都涵蓋 (繁/簡)。
 _ABSTAIN_PAT = re.compile(
     r"(don'?t|do not|doesn'?t) have enough (evidence|information)"
     r"|not enough (evidence|information|context)"
     r"|insufficient (evidence|information|context)"
-    r"|cannot (answer|determine)|unable to (answer|determine)",
+    r"|cannot (answer|determine)|unable to (answer|determine)"
+    r"|無法(回答|判斷|確定)|无法(回答|判断|确定)"
+    r"|(沒有|没有)(足夠|足够)"
+    r"|(資訊|資料|證據|信息|资料|证据)不足"
+    r"|不足以(回答|判斷|判断)",
     re.IGNORECASE,
 )
 
@@ -182,6 +194,7 @@ class ChunkIndex:
         self._doc_norm: dict[int, np.ndarray] = {}    # idx -> 正規化 chunk 向量
         self._q_cache: dict[str, np.ndarray] = {}     # 正規化後的 query 向量
         self.embed_tokens = 0                          # 成本: embedding token 累計
+        self.extra_tokens = 0                          # 成本: reranker token (估算)
 
     def bm25_scores(self, query: str) -> np.ndarray:
         if self._bm25 is None:
@@ -247,7 +260,41 @@ def decompose_query(question: str) -> tuple[list[str], int]:
     return (subs[:3] or [question]), tokens
 
 
-# --- 4. 檢索 (含多查詢合併 + 可選 rerank) ---------------------------------
+# --- 4. Rerank (專用 reranker 模型，失效退回 dense) --------------------------
+_rerank_disabled = False   # 端點失效時本進程退回 dense rerank (只警告一次)
+
+
+def _rerank_api(query: str, passages: list[str]) -> list[float] | None:
+    """NIM reranker 端點 (非 OpenAI 介面)。回傳各 passage 分數；
+    不可用時回 None，呼叫端退回 dense-cosine 重排。429/5xx 指數退避。"""
+    global _rerank_disabled
+    if _rerank_disabled or RERANK_MODEL == "dense":
+        return None
+    headers = {"Authorization": f"Bearer {os.environ.get('NVIDIA_API_KEY', '')}",
+               "Accept": "application/json"}
+    body = {"model": RERANK_MODEL, "query": {"text": query},
+            "passages": [{"text": p} for p in passages], "truncate": "END"}
+    for attempt in range(4):
+        try:
+            r = requests.post(RERANK_URL, headers=headers, json=body, timeout=60)
+            if r.status_code in (429, 500, 502, 503, 504):
+                time.sleep(2.0 * (2 ** attempt))
+                continue
+            if r.status_code != 200:
+                raise RuntimeError(f"HTTP {r.status_code}: {r.text[:200]}")
+            scores = [0.0] * len(passages)
+            for item in r.json()["rankings"]:
+                scores[item["index"]] = float(item["logit"])
+            return scores
+        except Exception as e:  # noqa: BLE001 — reranker 掛掉不該讓整輪評估死掉
+            if attempt == 3:
+                print(f"[warn] reranker 端點不可用，本進程退回 dense rerank: {e}")
+                _rerank_disabled = True
+                return None
+    return None
+
+
+# --- 5. 檢索 (含多查詢合併 + 可選 rerank) ---------------------------------
 def retrieve(index: ChunkIndex, queries: list[str], cfg: RagConfig) -> list[int]:
     """對 (一或多個) query 檢索，合併候選，可選 rerank，回傳 top_k chunk index。"""
     chunks = index.chunks
@@ -262,16 +309,28 @@ def retrieve(index: ChunkIndex, queries: list[str], cfg: RagConfig) -> list[int]
     if not cfg.rerank:
         return np.argsort(best)[::-1][:k].tolist()
 
-    # rerank: 先取較寬的候選，再用 dense 對「原始問題」重排取 top_k
-    # (只 embed 候選子集；dense/hybrid 已算過的向量直接重用)
+    use_api = RERANK_MODEL != "dense" and not _rerank_disabled
+    # dense 檢索 + 單 query 時，dense-cosine 重排與不重排「完全等價」(同一分數
+    # 函數重新排序)；沒有 reranker 模型可用時直接跳過，省一次假動作
+    if not use_api and cfg.retriever == "dense" and len(queries) == 1:
+        return np.argsort(best)[::-1][:k].tolist()
+
+    # 先取較寬的候選，再對「原始問題」重排取 top_k
     wide = min(max(k * 2, k + 3), len(chunks))
     cand = np.argsort(best)[::-1][:wide].tolist()
-    rr = index.dense_scores(queries[0], subset=cand)
+    cand_texts = [chunks[i] for i in cand]
+    scores = _rerank_api(queries[0], cand_texts) if use_api else None
+    if scores is not None:
+        # reranker 端點不回 usage，token 成本以 chars/4 估算
+        index.extra_tokens += sum(len(t) for t in cand_texts + [queries[0]]) // 4
+        rr = np.asarray(scores, dtype=float)
+    else:
+        rr = index.dense_scores(queries[0], subset=cand)
     order = np.argsort(rr)[::-1][:k]
     return [cand[i] for i in order]
 
 
-# --- 5. Generation ---------------------------------------------------------
+# --- 6. Generation ---------------------------------------------------------
 SYSTEM_PROMPT = (
     "You are a precise question-answering assistant. "
     "Answer ONLY using the provided context. "
@@ -298,7 +357,7 @@ def generate(query: str, retrieved_chunks: list[str]) -> tuple[str, int]:
     return resp.choices[0].message.content.strip(), tokens
 
 
-# --- 6. 完整 pipeline ------------------------------------------------------
+# --- 7. 完整 pipeline ------------------------------------------------------
 @dataclass
 class RagResult:
     answer: str
@@ -351,7 +410,7 @@ def run_rag(question: str, paragraphs: list[str], cfg: RagConfig) -> RagResult:
                 abstained = True
                 faithful = 1.0
 
-    tokens += index.embed_tokens
+    tokens += index.embed_tokens + index.extra_tokens
     return RagResult(answer=answer, retrieved_idx=idx, retrieved_chunks=picked,
                      faithful=faithful, abstained=abstained, tokens=tokens,
                      latency=time.perf_counter() - t0)

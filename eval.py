@@ -30,6 +30,18 @@ from rag import RagConfig, run_rag, is_abstain
 load_dotenv()  # 讀 .env 的 NVIDIA_API_KEY
 
 MAX_ERROR_RATE = 0.10   # 單輪容忍的單題失敗比例；超過就整輪作廢 (不落 cache)
+MIN_RACE_QUESTIONS = 5  # racing: 至少評這麼多題才允許提早停止
+
+
+class EvalPruned(Exception):
+    """Racing 提早停止: objective 的樂觀上界已追不上目前最佳配置。
+    帶部分平均分數供軌跡/排行榜顯示 (不會寫入 cache)。"""
+
+    def __init__(self, n_done: int, bound: float, partial_score: dict):
+        super().__init__(f"提早停止 @{n_done} 題 (上界 {bound:.3f})")
+        self.n_done = n_done
+        self.bound = bound
+        self.partial_score = partial_score
 
 
 # --- 資料載入 + 分層抽樣 ---------------------------------------------------
@@ -81,12 +93,25 @@ def load_hotpot(n: int = 30, n_hard: int = 15, seed: int = 42) -> list[Example]:
     return [_build_example(ds[i]) for i in picked]
 
 
-# --- SQuAD 風格 EM / F1 ----------------------------------------------------
+# --- SQuAD 風格 EM / F1 (含 CJK 支援) ---------------------------------------
+_CJK_RE = re.compile(r"[一-鿿]")
+_CJK_PUNCT = "，。、；：「」『』（）《》〈〉！？．·—～“”‘’"
+
+
 def normalize_answer(s: str) -> str:
     s = s.lower()
-    s = "".join(ch for ch in s if ch not in set(string.punctuation))
+    drop = set(string.punctuation) | set(_CJK_PUNCT)
+    s = "".join(ch for ch in s if ch not in drop)
     s = re.sub(r"\b(a|an|the)\b", " ", s)
-    return " ".join(s.split())
+    s = " ".join(s.split())
+    if _CJK_RE.search(s):
+        s = s.replace(" ", "")   # CJK 不以空白斷詞；去空白讓 EM/子字串比對穩定
+    return s
+
+
+def _tokens(s: str) -> list[str]:
+    """F1 的斷詞: 含 CJK 用字元級 (空白斷詞會把整句中文當一個 token，F1 失真)。"""
+    return list(s) if _CJK_RE.search(s) else s.split()
 
 
 def exact_match(pred: str, gold: str) -> float:
@@ -94,8 +119,8 @@ def exact_match(pred: str, gold: str) -> float:
 
 
 def f1_score(pred: str, gold: str) -> float:
-    pred_toks = normalize_answer(pred).split()
-    gold_toks = normalize_answer(gold).split()
+    pred_toks = _tokens(normalize_answer(pred))
+    gold_toks = _tokens(normalize_answer(gold))
     if not pred_toks or not gold_toks:
         return float(pred_toks == gold_toks)
     common = Counter(pred_toks) & Counter(gold_toks)
@@ -202,7 +227,22 @@ def _classify(recall: float, correct: float, abstained: bool) -> str:
     return "generation"
 
 
-def evaluate(cfg: RagConfig, examples: list[Example], verbose: bool = True) -> EvalScore:
+def _partial_score(em_s, f1_s, rec_s, faith_s, corr_s, abst_s, lat_s, tok_s,
+                   n_ok: int, errors: int) -> dict:
+    """racing 提早停止時的部分平均 (供軌跡顯示，欄位對齊 EvalScore.as_dict)。"""
+    n = max(1, n_ok)
+    return {"em": em_s / n, "f1": f1_s / n, "recall": rec_s / n,
+            "faithfulness": faith_s / n, "correctness": corr_s / n,
+            "abstain_rate": abst_s / n, "avg_latency": lat_s / n,
+            "avg_tokens": tok_s / n, "n": n_ok, "n_errors": errors,
+            "pruned": True}
+
+
+def evaluate(cfg: RagConfig, examples: list[Example], verbose: bool = True,
+             prune_below: float | None = None, prune_lam: float = 0.5) -> EvalScore:
+    """評估一組配置。prune_below 給定時啟用 racing:
+    評到一半若「剩餘題全對且零幻覺」的樂觀上界仍低於 prune_below，
+    拋 EvalPruned 提早停止，省下注定追不上的評估成本。"""
     # 局部 import 避免模組載入順序問題
     from judge import judge_correctness, judge_faithfulness
 
@@ -246,6 +286,23 @@ def evaluate(cfg: RagConfig, examples: list[Example], verbose: bool = True) -> E
             fail_type=_classify(rec, correct, abstained),
             retrieved_preview=" | ".join(c[:120] for c in res.retrieved_chunks[:3]),
         ))
+
+        # --- racing: 樂觀上界追不上就提早停止 --------------------------------
+        done = len(details) + errors
+        if (prune_below is not None and len(details) > 0
+                and done >= max(MIN_RACE_QUESTIONS, len(examples) // 3)):
+            remaining = len(examples) - done
+            n_final = len(details) + remaining      # 假設剩餘題全部評估成功
+            halluc_so_far = len(details) - faith_s
+            # 上界: 剩餘題全對、零幻覺 (成本項 μ 只會再扣分，忽略仍是合法上界)
+            bound = (corr_s + remaining) / n_final - prune_lam * halluc_so_far / n_final
+            if bound < prune_below:
+                if verbose:
+                    tqdm.write(f"[race] 提早停止 @{done} 題: 上界 {bound:.3f} "
+                               f"< 目前最佳 {prune_below:.3f}")
+                raise EvalPruned(done, bound, _partial_score(
+                    em_s, f1_s, rec_s, faith_s, corr_s, abst_s, lat_s, tok_s,
+                    len(details), errors))
 
     n_ok = len(details)
     # 失敗題過多 (例如整段 429/5xx 風暴) -> 分數已失真，拋出且「不落 cache」，

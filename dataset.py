@@ -23,11 +23,14 @@ CLI (生成 QA，一次性，之後 run.py/sweep.py 用 --qa 載入):
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import json
 import os
 import random
 import re
+from collections import Counter
+from itertools import combinations
 from pathlib import Path
 
 from eval import Example, normalize_answer
@@ -35,10 +38,13 @@ from optimizer import META_MODEL, chat_json
 
 # QA 生成模型: 預設用 meta 模型 (題目品質比 8b 生成器好)，可在 .env 覆寫
 QA_GEN_MODEL = os.environ.get("QA_GEN_MODEL", META_MODEL)
+# 掃描 PDF 頁的 VLM 轉錄模型 (只有無文字層的頁面才會用到)
+VLM_MODEL = os.environ.get("VLM_MODEL", "meta/llama-3.2-11b-vision-instruct")
 
 PARA_MIN_CHARS = 30      # 太短的段落 (標題/雜訊) 不當語料 (CJK 密度高，別設太嚴)
 MAX_PARAGRAPHS = 500     # 語料上限: 這是 demo 級調參台，不是向量資料庫
 MAX_GOLD_PER_Q = 2       # 答案出現在很多段時最多取 2 段當 gold (對齊 HotpotQA)
+_PAGE_MIN_CHARS = 50     # PDF 頁文字層低於此字數視為掃描頁 -> VLM fallback
 
 
 # --- 1. 語料載入 -------------------------------------------------------------
@@ -48,18 +54,73 @@ def split_paragraphs(text: str) -> list[str]:
     return [p for p in paras if len(p) >= PARA_MIN_CHARS]
 
 
-def load_corpus(path: str | Path) -> list[str]:
-    """讀單一 .txt/.md 檔或資料夾內全部 .txt/.md，回傳段落列表。"""
+# --- 1b. PDF: 文字層優先，掃描頁走 VLM 轉錄 ----------------------------------
+def _vlm_transcribe(jpg_b64: str) -> str:
+    """把一頁 PDF 的影像丟給 NIM 的 VLM 轉錄成文字 (OpenAI 多模態訊息格式)。"""
+    from rag import api_call, get_client   # 局部 import 避免循環
+    resp = api_call(
+        get_client().chat.completions.create,
+        model=VLM_MODEL,
+        messages=[{"role": "user", "content": [
+            {"type": "text", "text":
+                "Transcribe ALL text on this document page into plain text. "
+                "Preserve the reading order and paragraph breaks (blank line "
+                "between paragraphs). Output ONLY the transcription."},
+            {"type": "image_url",
+             "image_url": {"url": f"data:image/jpeg;base64,{jpg_b64}"}},
+        ]}],
+        temperature=0.0,
+        max_tokens=2000,
+    )
+    return resp.choices[0].message.content.strip()
+
+
+def extract_pdf_text(source: str | Path | bytes, log_fn=None) -> str:
+    """PDF -> 文字。逐頁先抽文字層 (原生數位 PDF 免費零錯字)；
+    無文字層/垃圾頁 (掃描頁) 才送 VLM 轉錄。
+    注意: VLM 轉錄可能有錯字，會成為評估語料的一部分，掃描檔請抽查品質。"""
+    say = log_fn or (lambda *_: None)
+    try:
+        import fitz  # pymupdf
+    except ImportError as e:
+        raise SystemExit("PDF 支援需要 pymupdf: pip install pymupdf") from e
+    doc = (fitz.open(stream=source, filetype="pdf") if isinstance(source, bytes)
+           else fitz.open(str(source)))
+    pages: list[str] = []
+    for i, page in enumerate(doc):
+        text = page.get_text("text").strip()
+        if len(text) >= _PAGE_MIN_CHARS:
+            pages.append(text)
+            continue
+        say(f"  [pdf] 第 {i + 1} 頁無文字層 (掃描頁?)，送 VLM 轉錄…")
+        try:
+            pix = page.get_pixmap(dpi=96)
+            b64 = base64.b64encode(pix.tobytes("jpg")).decode()
+            t = _vlm_transcribe(b64)
+            if t:
+                pages.append(t)
+        except Exception as e:  # noqa: BLE001 — 單頁失敗不中斷整份文件
+            say(f"  [pdf][warn] 第 {i + 1} 頁 VLM 轉錄失敗，跳過: {e}")
+    doc.close()
+    return "\n\n".join(pages)
+
+
+def load_corpus(path: str | Path, log_fn=None) -> list[str]:
+    """讀單一檔或資料夾內全部 .txt/.md/.pdf，回傳段落列表。"""
     p = Path(path)
     if not p.exists():
         raise FileNotFoundError(f"找不到語料路徑: {p}")
     files = sorted(f for f in (p.rglob("*") if p.is_dir() else [p])
-                   if f.is_file() and f.suffix.lower() in {".txt", ".md"})
+                   if f.is_file() and f.suffix.lower() in {".txt", ".md", ".pdf"})
     if not files:
-        raise ValueError(f"{p} 底下沒有 .txt/.md 檔 (目前只支援純文字格式)")
+        raise ValueError(f"{p} 底下沒有 .txt/.md/.pdf 檔")
     paras: list[str] = []
     for f in files:
-        paras += split_paragraphs(f.read_text(encoding="utf-8", errors="ignore"))
+        if f.suffix.lower() == ".pdf":
+            text = extract_pdf_text(f, log_fn=log_fn)
+        else:
+            text = f.read_text(encoding="utf-8", errors="ignore")
+        paras += split_paragraphs(text)
     if not paras:
         raise ValueError(f"語料是空的 (段落須 ≥{PARA_MIN_CHARS} 字元，空行分段)")
     if len(paras) > MAX_PARAGRAPHS:
@@ -84,32 +145,98 @@ _QA_PROMPT = (
 )
 
 
+_MULTIHOP_PROMPT = (
+    "You are creating a MULTI-HOP QA evaluation set for a retrieval-augmented "
+    "QA system.\nGiven TWO passages, write ONE question that can only be "
+    "answered by combining information from BOTH passages, plus its answer.\n"
+    "Rules:\n"
+    "- The answer must be a short exact span copied from one of the passages "
+    "(a name, date, number, entity, or short phrase — at most 8 words).\n"
+    "- The question must be self-contained and must genuinely require both "
+    "passages (do not write a question answerable from a single passage).\n"
+    "- Write the question and answer in the same language as the passages.\n"
+    'Output JSON only: {"question": "...", "answer": "..."}\n\n'
+)
+
+
+def _rare_tokens(p: str) -> set[str]:
+    """段落的「稀有 token 候選」: 拉丁字 (≥4 字元) + CJK 連續片段的 2-gram。"""
+    toks = {t.lower() for t in re.findall(r"[A-Za-z][A-Za-z0-9\-]{3,}", p)}
+    for run in re.findall(r"[一-鿿]{2,}", p):
+        toks.update(run[i:i + 2] for i in range(len(run) - 1))
+    return toks
+
+
+def _related_pairs(paragraphs: list[str], rng: random.Random) -> list[tuple[int, int]]:
+    """找「共享稀有 token」的段落對 (多跳題需要兩段有實體關聯，隨機配對會不自然)。
+    稀有 = 該 token 只出現在 2~3 個段落。依共享數排序，同分隨機。"""
+    tok_paras: dict[str, list[int]] = {}
+    for i, p in enumerate(paragraphs):
+        for t in _rare_tokens(p):
+            tok_paras.setdefault(t, []).append(i)
+    pair_score: Counter = Counter()
+    for t, idxs in tok_paras.items():
+        if 2 <= len(idxs) <= 3:
+            for a, b in combinations(idxs, 2):
+                pair_score[(a, b)] += 1
+    pairs = list(pair_score)
+    rng.shuffle(pairs)                       # 同分時順序隨機
+    pairs.sort(key=lambda pr: -pair_score[pr])
+    return pairs
+
+
+def _gen_one(prompt: str, passages: list[str]) -> dict | None:
+    """呼叫 LLM 生成一題；答案必須是某段落內的 span，否則回 None (品質守門)。"""
+    result = chat_json(prompt, temperature=0.3, max_tokens=300, model=QA_GEN_MODEL)
+    q = str(result.get("question", "")).strip()
+    a = str(result.get("answer", "")).strip()
+    if not q or not a:
+        return None
+    if not any(normalize_answer(a) in normalize_answer(p) for p in passages):
+        return None
+    return {"question": q, "answer": a, "gold": list(passages)}
+
+
 def generate_qa(paragraphs: list[str], n: int, seed: int = 42,
-                log_fn=None) -> list[dict]:
-    """對隨機抽到的段落各生成一題可抽取式 QA。
-    答案必須 (正規化後) 出現在來源段落，否則丟棄重抽 —— 保證 gold 可定位、
-    判官與 recall 都有依據。回傳 [{question, answer, gold:[來源段落]}]。"""
+                log_fn=None, multihop: bool = False) -> list[dict]:
+    """生成可抽取式 QA。答案必須 (正規化後) 出現在來源段落 —— 保證 gold
+    可定位、判官與 recall 都有依據。multihop=True 時約一半的題改成
+    「跨兩個相關段落」的多跳題 (讓 query_decompose 開關有東西可學)。
+    回傳 [{question, answer, gold:[來源段落...], hop}]。"""
     say = log_fn or (lambda *_: None)
     rng = random.Random(seed)
+    qa: list[dict] = []
+
+    # 多跳題: 從共享稀有 token 的段落對生成
+    if multihop:
+        n_mh = n // 2
+        for i, j in _related_pairs(paragraphs, rng):
+            if len(qa) >= n_mh:
+                break
+            pair = [paragraphs[i], paragraphs[j]]
+            prompt = (_MULTIHOP_PROMPT
+                      + f"PASSAGE 1:\n{pair[0]}\n\nPASSAGE 2:\n{pair[1]}")
+            rec = _gen_one(prompt, pair)
+            if rec:
+                rec["hop"] = 2
+                qa.append(rec)
+                say(f"  QA 生成 (多跳) {len(qa)}/{n}")
+        if not qa:
+            say("  [warn] 找不到可配對的相關段落，多跳題略過 (全部生成單跳)")
+
+    # 單跳題: 補滿剩餘題數
     order = list(range(len(paragraphs)))
     rng.shuffle(order)
-
-    qa: list[dict] = []
     for idx in order:
         if len(qa) >= n:
             break
         para = paragraphs[idx]
-        result = chat_json(_QA_PROMPT + para, temperature=0.3,
-                           max_tokens=300, model=QA_GEN_MODEL)
-        q = str(result.get("question", "")).strip()
-        a = str(result.get("answer", "")).strip()
-        if not q or not a:
-            continue
-        if normalize_answer(a) not in normalize_answer(para):
-            continue   # 答案不是段落內的 span -> 丟棄 (品質守門)
-        qa.append({"question": q, "answer": a, "gold": [para]})
-        if len(qa) % 5 == 0 or len(qa) == n:
-            say(f"  QA 生成 {len(qa)}/{n}")
+        rec = _gen_one(_QA_PROMPT + para, [para])
+        if rec:
+            rec["hop"] = 1
+            qa.append(rec)
+            if len(qa) % 5 == 0 or len(qa) == n:
+                say(f"  QA 生成 {len(qa)}/{n}")
 
     if not qa:
         raise RuntimeError("QA 生成全數失敗 (檢查 API 金鑰 / 語料是否為可讀文字)")
@@ -209,15 +336,18 @@ def dataset_fingerprint(paragraphs: list[str], qa_records: list[dict]) -> str:
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(
         description="用 LLM 對你的文件生成 QA 評估集 (可抽取式短答)")
-    ap.add_argument("--corpus", required=True, help=".txt/.md 檔或資料夾")
+    ap.add_argument("--corpus", required=True, help=".txt/.md/.pdf 檔或資料夾")
     ap.add_argument("--n", type=int, default=20, help="生成題數 (預設 20)")
     ap.add_argument("--out", default="data/qa.jsonl", help="輸出 jsonl 路徑")
+    ap.add_argument("--multihop", action="store_true",
+                    help="約一半生成跨段落多跳題 (query_decompose 才有東西可學)")
     ap.add_argument("--seed", type=int, default=42)
     args = ap.parse_args()
 
-    paras = load_corpus(args.corpus)
+    paras = load_corpus(args.corpus, log_fn=print)
     print(f"語料載入: {len(paras)} 段。開始生成 {args.n} 題 (模型: {QA_GEN_MODEL})…")
-    qa = generate_qa(paras, n=args.n, seed=args.seed, log_fn=print)
+    qa = generate_qa(paras, n=args.n, seed=args.seed, log_fn=print,
+                     multihop=args.multihop)
     save_qa(qa, args.out)
     print(f"\n已存 {len(qa)} 題 -> {args.out}")
     print(f"範例: Q: {qa[0]['question']}\n      A: {qa[0]['answer']}")

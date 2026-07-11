@@ -20,8 +20,9 @@ import random
 from rag import RagConfig
 from cache import ResultCache, config_to_dict
 from memory.trajectory import Trajectory
-from optimizer import (DEFAULT_LAMBDA, SEARCH_SPACE, all_configs, chat_json,
-                       objective, _trial, _make_say)
+from optimizer import (DEFAULT_LAMBDA, DEFAULT_MU, SEARCH_SPACE, all_configs,
+                       chat_json, objective, _trial, _make_say, _incumbent,
+                       _race_note, _warm_init)
 
 
 def _ask_region(traj: Trajectory) -> dict:
@@ -54,7 +55,8 @@ def _ask_region(traj: Trajectory) -> dict:
 
 def hybrid_search(examples, cache: ResultCache, budget: int, seed: int, traj_path: str,
                   n_init: int = 3, verbose: bool = True, log_fn=None,
-                  lam: float = DEFAULT_LAMBDA) -> Trajectory:
+                  lam: float = DEFAULT_LAMBDA, mu: float = DEFAULT_MU,
+                  warm_configs: list[dict] | None = None) -> Trajectory:
     say = _make_say(log_fn, verbose)
     try:
         import optuna
@@ -68,11 +70,14 @@ def hybrid_search(examples, cache: ResultCache, budget: int, seed: int, traj_pat
     traj = Trajectory(traj_path)
     traj.reset()
 
-    # 1) 暖身 (與其他策略同 seed)
-    for cfg in grid[:n_init]:
-        traj.add(_trial(cache.evaluate_cached(cfg, examples, verbose=verbose),
-                        "init", lam))
-        say(f"[暖身] {config_to_dict(cfg)}")
+    # 1) 暖身 (與其他策略同 seed；warm-start 開啟時取代部分暖身組)
+    init_list, n_warm = _warm_init(grid, warm_configs, n_init)
+    for i, cfg in enumerate(init_list):
+        rec = cache.evaluate_cached(cfg, examples, verbose=verbose,
+                                    prune_below=_incumbent(traj), prune_lam=lam)
+        traj.add(_trial(rec, "init", lam, mu))
+        say(f"[{'warm-start' if i < n_warm else '暖身'}] {config_to_dict(cfg)}"
+            f"{_race_note(rec)}")
 
     def run_phase(region: dict, target: int, phase_seed: int) -> None:
         """Optuna 在 region 內收斂，直到軌跡達 target 次評估。"""
@@ -83,11 +88,15 @@ def hybrid_search(examples, cache: ResultCache, budget: int, seed: int, traj_pat
             # 已達本階段目標且是沒評估過的新配置 -> 直接剪枝，不再花 API
             if is_new and len(traj.trials) >= target:
                 raise optuna.TrialPruned()
-            rec = cache.evaluate_cached(cfg, examples, verbose=verbose)
+            rec = cache.evaluate_cached(cfg, examples, verbose=verbose,
+                                        prune_below=_incumbent(traj), prune_lam=lam)
             # 只把「新配置」記進軌跡，讓 best-so-far 曲線以「不同評估次數」計
             if is_new:
-                traj.add(_trial(rec, "hybrid", lam))
-            return objective(rec["score"], lam)
+                traj.add(_trial(rec, "hybrid", lam, mu))
+            # racing 提早停止的配置: 確定劣於當時最佳，對 Optuna 也標為剪枝
+            if rec.get("pruned"):
+                raise optuna.TrialPruned()
+            return objective(rec["score"], lam, mu)
 
         study = optuna.create_study(direction="maximize",
                                     sampler=optuna.samplers.TPESampler(seed=phase_seed))
