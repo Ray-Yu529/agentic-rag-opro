@@ -7,26 +7,42 @@ cache.py — 快取式評估
 
 random / OPRO / hybrid 共用同一個 cache.json，重疊到的配置零成本。
 
-快取鍵 = 測試集 fingerprint + config: 不同 (n, n_hard, seed) 的測試集
-分數不可比，各自成一格，避免 Web UI 改題數後沿用到舊測試集的分數。
+快取鍵 = 測試集 fingerprint + 評估指紋 + config:
+- 不同 (n, n_hard, seed) 的測試集分數不可比，各自成一格，
+  避免 Web UI 改題數後沿用到舊測試集的分數。
+- 評估指紋含模型 id + 生成 prompt + EVAL_VERSION：換模型、改 prompt
+  或評估邏輯改版後，舊分數自動失效，不會被無聲沿用。
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
-from rag import RagConfig
+from rag import RagConfig, GEN_MODEL, EMBED_MODEL, SYSTEM_PROMPT
+from judge import JUDGE_MODEL
 
 CACHE_PATH = Path(__file__).parent / "cache.json"
 
 _FIELDS = ("chunk_size", "top_k", "retriever", "chunk_overlap",
            "rerank", "query_decompose", "verify")
 
+# 評估邏輯/指標「語意」改動時手動 +1 (例如改判官 prompt、改 recall 定義)，
+# 讓舊 cache 全部失效。
+EVAL_VERSION = 2
+
+
+def _eval_fingerprint() -> str:
+    """模型 + prompt 版本指紋: 換模型或改 prompt 後，舊分數不可沿用。"""
+    blob = "|".join([str(EVAL_VERSION), GEN_MODEL, EMBED_MODEL,
+                     JUDGE_MODEL, SYSTEM_PROMPT])
+    return hashlib.sha1(blob.encode("utf-8")).hexdigest()[:8]
+
 
 def dataset_key(n: int, n_hard: int, seed: int = 42) -> str:
-    """測試集 fingerprint (load_hotpot 的參數)。"""
-    return f"hotpot|n={n}|hard={n_hard}|seed={seed}"
+    """測試集 fingerprint (load_hotpot 的參數) + 評估指紋。"""
+    return f"hotpot|n={n}|hard={n_hard}|seed={seed}|ev={_eval_fingerprint()}"
 
 
 DEFAULT_DATASET = dataset_key(30, 15, 42)   # CLI (sweep/run/plot) 的預設測試集
@@ -60,11 +76,16 @@ class ResultCache:
         return self.store.get(self._key(cfg))
 
     def _save(self) -> None:
-        self.path.write_text(
+        # 寫暫存檔再原子替換: 中斷/並行寫入不會留下半截 JSON。
+        # (CLI 與 server 同時跑仍可能互相覆蓋「新增的」條目，Demo 等級可接受。)
+        tmp = self.path.with_suffix(".json.tmp")
+        tmp.write_text(
             json.dumps(self.store, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(self.path)
 
     def evaluate_cached(self, cfg: RagConfig, examples, verbose: bool = False) -> dict:
-        """回傳該配置的完整 record (命中快取則不呼叫 API)。"""
+        """回傳該配置的完整 record (命中快取則不呼叫 API)。
+        評估失敗題過多時 evaluate 會拋出 -> 不落 cache (避免壞分數被永久快取)。"""
         hit = self.get(cfg)
         if hit is not None:
             return hit
@@ -75,6 +96,8 @@ class ResultCache:
             "score": score.as_dict(),
             "failures": [d.as_dict() for d in score.worst_cases(2)],
             "fail_clusters": score.fail_clusters(),
+            # 逐題對錯 (question -> 0/1): 供 sweep.py 做成對顯著性檢定
+            "per_question_correct": {d.question: d.correct for d in (score.details or [])},
         }
         self.store[self._key(cfg)] = record
         self._save()

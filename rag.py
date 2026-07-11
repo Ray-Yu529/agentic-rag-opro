@@ -14,6 +14,7 @@ rag.py — 被優化的 Agentic RAG 系統
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import time
@@ -21,17 +22,36 @@ from dataclasses import dataclass, field, replace
 from functools import lru_cache
 
 import numpy as np
+from dotenv import load_dotenv
 from openai import (APIConnectionError, APITimeoutError, InternalServerError,
                     OpenAI, RateLimitError)
 from rank_bm25 import BM25Okapi
 
+load_dotenv()  # 先讀 .env，下面模型 id 的環境變數覆寫才吃得到
+
 # --- NVIDIA NIM 端點設定 ---------------------------------------------------
 NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
-GEN_MODEL = "meta/llama-3.1-8b-instruct"            # RAG generator (便宜、量大)
-EMBED_MODEL = "nvidia/llama-3.2-nv-embedqa-1b-v2"   # dense 檢索 / rerank 用
+# 模型 id 可用環境變數覆寫 (端點 404/不穩時換模型，或換私有 OpenAI 相容端點)
+GEN_MODEL = os.environ.get("GEN_MODEL", "meta/llama-3.1-8b-instruct")     # generator (便宜、量大)
+EMBED_MODEL = os.environ.get("EMBED_MODEL", "nvidia/llama-3.2-nv-embedqa-1b-v2")  # dense 檢索 / rerank
 # 註: model id 請到 build.nvidia.com 對最新清單; 介面是 OpenAI 相容的。
 
 ABSTAIN = "I don't have enough evidence to answer."
+
+# 生成器在 context 不足時會自行棄答 (SYSTEM_PROMPT 有指示)。不論 verify 開關，
+# 棄答式回答都必須按同一規則計分 (見 eval.py)，否則 objective 會隱性補貼 verify。
+_ABSTAIN_PAT = re.compile(
+    r"(don'?t|do not|doesn'?t) have enough (evidence|information)"
+    r"|not enough (evidence|information|context)"
+    r"|insufficient (evidence|information|context)"
+    r"|cannot (answer|determine)|unable to (answer|determine)",
+    re.IGNORECASE,
+)
+
+
+def is_abstain(answer: str) -> bool:
+    """答案是否為棄答式回答 (verify 守門員的 ABSTAIN 或生成器自行棄答)。"""
+    return answer.strip() == ABSTAIN or bool(_ABSTAIN_PAT.search(answer))
 
 
 @lru_cache(maxsize=1)
@@ -98,18 +118,46 @@ def _tokenize(text: str) -> list[str]:
     return text.lower().split()
 
 
+# 進程級 embedding 快取: chunk 只由 chunk_size/overlap 決定，同 chunk_size 的
+# 所有配置 chunk 文字完全相同 —— 不快取的話每個配置都重打一輪 embedding API。
+# 命中時把「首次呼叫按字元比例攤提」的 token 成本記回，讓 avg_tokens 仍反映
+# 該配置獨立執行的成本，不因評估順序而失真。
+_EMBED_BATCH = 32   # NIM embedding 端點有單次 batch 上限，分批送
+_embed_cache: dict[str, tuple[np.ndarray, int]] = {}   # key -> (向量, 攤提 token)
+
+
+def _embed_key(text: str, input_type: str) -> str:
+    return input_type + ":" + hashlib.sha1(text.encode("utf-8")).hexdigest()
+
+
 def _embed(texts: list[str], input_type: str) -> tuple[np.ndarray, int]:
     """NVIDIA embedding。input_type 必為 query/passage (nv-embedqa 強制)。
-    回傳 (向量, 用掉的 token)。"""
-    client = get_client()
-    resp = api_call(
-        client.embeddings.create,
-        model=EMBED_MODEL,
-        input=texts,
-        extra_body={"input_type": input_type, "truncate": "END"},
-    )
-    tokens = resp.usage.total_tokens if getattr(resp, "usage", None) else 0
-    return np.asarray([d.embedding for d in resp.data], dtype=float), tokens
+    回傳 (向量, 攤提的 token 成本)；快取命中不打 API。"""
+    keys = [_embed_key(t, input_type) for t in texts]
+    todo: dict[str, str] = {}   # 未快取的 key -> 文字 (順便去重)
+    for k, t in zip(keys, texts):
+        if k not in _embed_cache and k not in todo:
+            todo[k] = t
+    if todo:
+        client = get_client()
+        todo_keys = list(todo)
+        for s in range(0, len(todo_keys), _EMBED_BATCH):
+            batch_keys = todo_keys[s:s + _EMBED_BATCH]
+            batch_texts = [todo[k] for k in batch_keys]
+            resp = api_call(
+                client.embeddings.create,
+                model=EMBED_MODEL,
+                input=batch_texts,
+                extra_body={"input_type": input_type, "truncate": "END"},
+            )
+            tok = resp.usage.total_tokens if getattr(resp, "usage", None) else 0
+            total_chars = sum(len(t) for t in batch_texts) or 1
+            for k, t, d in zip(batch_keys, batch_texts, resp.data):
+                vec = np.asarray(d.embedding, dtype=np.float32)
+                _embed_cache[k] = (vec, round(tok * len(t) / total_chars))
+    vecs = np.stack([_embed_cache[k][0] for k in keys]).astype(float)
+    tokens = sum(_embed_cache[k][1] for k in keys)
+    return vecs, tokens
 
 
 def _minmax(x: np.ndarray) -> np.ndarray:
@@ -123,13 +171,15 @@ class ChunkIndex:
     """單題內重用的檢索索引。
 
     BM25 index 與 chunk embeddings 各只建一次；query_decompose 的多個子問題、
-    verify 守門員的二次檢索、rerank 都重用同一份，避免重複呼叫 embedding API。
+    verify 守門員的二次檢索、rerank 都重用同一份。chunk 向量以「索引」為單位
+    memo：bm25+rerank 只需 embed 候選子集，不再為重排少數候選 embed 全部 chunk。
+    (跨題/跨配置的相同文字另有進程級 _embed_cache，不重打 API。)
     """
 
     def __init__(self, chunks: list[str]):
         self.chunks = chunks
         self._bm25: BM25Okapi | None = None
-        self._doc_norm: np.ndarray | None = None      # 正規化後的 chunk 向量
+        self._doc_norm: dict[int, np.ndarray] = {}    # idx -> 正規化 chunk 向量
         self._q_cache: dict[str, np.ndarray] = {}     # 正規化後的 query 向量
         self.embed_tokens = 0                          # 成本: embedding token 累計
 
@@ -138,12 +188,14 @@ class ChunkIndex:
             self._bm25 = BM25Okapi([_tokenize(c) for c in self.chunks])
         return np.asarray(self._bm25.get_scores(_tokenize(query)), dtype=float)
 
-    def _doc_vectors(self) -> np.ndarray:
-        if self._doc_norm is None:
-            vecs, tok = _embed(self.chunks, "passage")
+    def _doc_matrix(self, indices: list[int]) -> np.ndarray:
+        missing = [i for i in indices if i not in self._doc_norm]
+        if missing:
+            vecs, tok = _embed([self.chunks[i] for i in missing], "passage")
             self.embed_tokens += tok
-            self._doc_norm = vecs / (np.linalg.norm(vecs, axis=1, keepdims=True) + 1e-8)
-        return self._doc_norm
+            for i, v in zip(missing, vecs):
+                self._doc_norm[i] = v / (np.linalg.norm(v) + 1e-8)
+        return np.stack([self._doc_norm[i] for i in indices])
 
     def _query_vector(self, query: str) -> np.ndarray:
         if query not in self._q_cache:
@@ -154,10 +206,8 @@ class ChunkIndex:
         return self._q_cache[query]
 
     def dense_scores(self, query: str, subset: list[int] | None = None) -> np.ndarray:
-        doc = self._doc_vectors()
-        if subset is not None:
-            doc = doc[subset]
-        return doc @ self._query_vector(query)
+        indices = list(subset) if subset is not None else list(range(len(self.chunks)))
+        return self._doc_matrix(indices) @ self._query_vector(query)
 
     def scores(self, query: str, retriever: str) -> np.ndarray:
         if retriever == "bm25":
@@ -213,7 +263,7 @@ def retrieve(index: ChunkIndex, queries: list[str], cfg: RagConfig) -> list[int]
         return np.argsort(best)[::-1][:k].tolist()
 
     # rerank: 先取較寬的候選，再用 dense 對「原始問題」重排取 top_k
-    # (chunk 向量已在 index 內，只挑 subset 重算 cosine，不再打 API)
+    # (只 embed 候選子集；dense/hybrid 已算過的向量直接重用)
     wide = min(max(k * 2, k + 3), len(chunks))
     cand = np.argsort(best)[::-1][:wide].tolist()
     rr = index.dense_scores(queries[0], subset=cand)

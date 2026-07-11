@@ -19,22 +19,12 @@ plt.rcParams["axes.unicode_minus"] = False
 
 from cache import ResultCache
 from memory.trajectory import Trajectory
+from pareto import pareto_front
 
 RESULTS = Path(__file__).parent / "results"
 STRATEGIES = {"random.jsonl": ("Random", "#888", "o"),
               "opro.jsonl": ("OPRO", "#d1495b", "s"),
               "hybrid.jsonl": ("Hybrid", "#2e7d32", "^")}
-
-
-def pareto_front(points: list[tuple[float, float]]) -> list[tuple[float, float]]:
-    """points = (hallucination, correctness)。要 hallucination 低、correctness 高。"""
-    pts = sorted(points, key=lambda p: (p[0], -p[1]))
-    front, best_corr = [], -1.0
-    for hall, corr in pts:
-        if corr > best_corr:
-            front.append((hall, corr))
-            best_corr = corr
-    return front
 
 
 def main() -> None:
@@ -49,10 +39,13 @@ def main() -> None:
         if not traj.trials:
             continue
         curve = traj.best_curve()
+        lam = traj.trials[-1].lam   # 該軌跡實際使用的 λ (跨 run 可能不同，標進圖例)
+        if lam is not None:
+            label = f"{label} (λ={lam})"
         ax1.plot(range(1, len(curve) + 1), curve, marker + "-",
                  label=label, color=color)
     ax1.set_xlabel("評估次數 (configs evaluated)")
-    ax1.set_ylabel("best objective so far\n(正確率 - 0.5×幻覺率)")
+    ax1.set_ylabel("best objective so far\n(正確率 - λ×幻覺率)")
     ax1.set_title("最佳化效率: 越快越高越好")
     ax1.legend(); ax1.grid(alpha=0.3)
 

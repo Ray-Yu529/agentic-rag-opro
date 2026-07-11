@@ -25,9 +25,11 @@ from datasets import load_dataset
 from dotenv import load_dotenv
 from tqdm import tqdm
 
-from rag import RagConfig, run_rag
+from rag import RagConfig, run_rag, is_abstain
 
 load_dotenv()  # 讀 .env 的 NVIDIA_API_KEY
+
+MAX_ERROR_RATE = 0.10   # 單輪容忍的單題失敗比例；超過就整輪作廢 (不落 cache)
 
 
 # --- 資料載入 + 分層抽樣 ---------------------------------------------------
@@ -64,7 +66,9 @@ def load_hotpot(n: int = 30, n_hard: int = 15, seed: int = 42) -> list[Example]:
     從 HotpotQA distractor validation 抽 n 題，分層: n_hard 題 hard + 其餘 easy/medium。
     這樣測試集才對「參數變化」有區分度 (純隨機會抽到一堆太簡單的題)。
     """
-    ds = load_dataset("hotpot_qa", "distractor", split="validation")
+    # 明確用 hotpotqa/hotpot_qa (Hub 上已是 parquet 格式)，
+    # datasets 3.x+ 移除 script 載入後仍可正常使用
+    ds = load_dataset("hotpotqa/hotpot_qa", "distractor", split="validation")
     rng = random.Random(seed)
 
     hard_idx = [i for i, lv in enumerate(ds["level"]) if lv == "hard"]
@@ -104,16 +108,20 @@ def f1_score(pred: str, gold: str) -> float:
 
 
 # --- 檢索 recall ----------------------------------------------------------
-def retrieval_recall(retrieved_chunks: list[str], gold_paragraphs: list[str]) -> float:
+def retrieval_recall(retrieved_chunks: list[str], gold_paragraphs: list[str],
+                     min_coverage: float = 0.5) -> float:
     """
-    gold 段落只要有任一被檢索到的 chunk 是它的子字串，就算命中。
-    (chunk 不跨段落，所以子字串包含關係成立。)
+    gold 段落被檢索 chunk 覆蓋的「字元比例」達 min_coverage 才算命中。
+    以前任一子字串就整段算命中，會偏袒小 chunk (撈到 256 字皮毛就滿分 recall，
+    但生成器實際拿到的資訊可能不含答案)。
+    (chunk 不跨段落，子字串包含關係成立；chunk_overlap=0 時同段 chunk 不重疊。)
     """
     if not gold_paragraphs:
         return 0.0
     hits = 0
     for gold in gold_paragraphs:
-        if any(chunk in gold for chunk in retrieved_chunks):
+        covered = sum(len(c) for c in set(retrieved_chunks) if c and c in gold)
+        if covered >= min_coverage * len(gold):
             hits += 1
     return hits / len(gold_paragraphs)
 
@@ -152,14 +160,16 @@ class EvalScore:
     abstain_rate: float        # verify 守門員棄答比例 (棄答≠幻覺，單獨追蹤)
     avg_latency: float         # 成本: 每題平均秒數
     avg_tokens: float          # 成本: 每題平均 token
-    n: int
+    n: int                     # 實際成功評估的題數 (分母)
+    n_errors: int = 0          # API 失敗被跳過的題數 (過多會整輪作廢，見 evaluate)
     details: list[QuestionDetail] = None
 
     def as_dict(self) -> dict:
         return {"em": self.em, "f1": self.f1, "recall": self.recall,
                 "faithfulness": self.faithfulness, "correctness": self.correctness,
                 "abstain_rate": self.abstain_rate,
-                "avg_latency": self.avg_latency, "avg_tokens": self.avg_tokens, "n": self.n}
+                "avg_latency": self.avg_latency, "avg_tokens": self.avg_tokens,
+                "n": self.n, "n_errors": self.n_errors}
 
     def hallucination_rate(self) -> float:
         return 1.0 - self.faithfulness
@@ -172,16 +182,19 @@ class EvalScore:
 
     def fail_clusters(self) -> dict[str, int]:
         """失敗分群計數，餵給 OPRO 推論瓶頸在檢索還是生成。"""
-        clusters = {"retrieval": 0, "generation": 0}
+        clusters = {"retrieval": 0, "generation": 0, "abstain": 0}
         for d in (self.details or []):
             if d.fail_type in clusters:
                 clusters[d.fail_type] += 1
         return clusters
 
 
-def _classify(recall: float, correct: float) -> str:
-    """先看答對與否: 答對就是 ok (HotpotQA 撈到一段 gold 也常答得對)。
+def _classify(recall: float, correct: float, abstained: bool) -> str:
+    """棄答自成一群 (讓 OPRO 看得到答案被守門員/生成器擋掉了多少)。
+    其餘先看答對與否: 答對就是 ok (HotpotQA 撈到一段 gold 也常答得對)。
     答錯才分群: recall<1 -> 檢索沒撈全; 撈全了仍答錯 -> 生成端問題。"""
+    if abstained:
+        return "abstain"
     if correct >= 1.0:
         return "ok"
     if recall < 1.0:
@@ -194,6 +207,7 @@ def evaluate(cfg: RagConfig, examples: list[Example], verbose: bool = True) -> E
     from judge import judge_correctness, judge_faithfulness
 
     em_s = f1_s = rec_s = faith_s = corr_s = abst_s = lat_s = tok_s = 0.0
+    errors = 0
     details: list[QuestionDetail] = []
     iterator = tqdm(examples, desc=str(cfg.key()), disable=not verbose)
     for ex in iterator:
@@ -201,35 +215,51 @@ def evaluate(cfg: RagConfig, examples: list[Example], verbose: bool = True) -> E
         # (及已花掉的 API 成本) 全部作廢
         try:
             res = run_rag(ex.question, ex.paragraphs, cfg)
-            # verify 已算過忠實度就重用，否則補算 (確保所有配置都有此指標可比)
-            if res.faithful is not None:
-                faithful = res.faithful
+            abstained = res.abstained or is_abstain(res.answer)
+            if abstained:
+                # 棄答統一計分 (不論 verify 開關): 沒有捏造內容 -> 不算幻覺；
+                # 答錯由 correctness=0 懲罰，另記 abstain_rate。
+                # 不統一的話 verify=False 的誠實棄答會被判官記成幻覺，
+                # objective 就隱性補貼 verify。順便省下兩次判官呼叫。
+                faithful, correct = 1.0, 0.0
             else:
-                faithful, _ = judge_faithfulness(res.answer, res.retrieved_chunks)
-            correct, _ = judge_correctness(ex.question, res.answer, ex.answer)
-        except Exception as e:  # noqa: BLE001  — 單題失敗不該中斷整輪
+                # verify 已算過忠實度就重用，否則補算 (確保所有配置都有此指標可比)
+                if res.faithful is not None:
+                    faithful = res.faithful
+                else:
+                    faithful, _ = judge_faithfulness(res.answer, res.retrieved_chunks)
+                correct, _ = judge_correctness(ex.question, res.answer, ex.answer)
+        except Exception as e:  # noqa: BLE001  — 單題偶發失敗不中斷，但過多會整輪作廢
+            errors += 1
             if verbose:
-                tqdm.write(f"[warn] 題目失敗，記 0 分: {e}")
+                tqdm.write(f"[warn] 題目失敗，跳過: {e}")
             continue
         em = exact_match(res.answer, ex.answer)
         f1 = f1_score(res.answer, ex.answer)
         rec = retrieval_recall(res.retrieved_chunks, ex.gold_paragraphs)
 
         em_s += em; f1_s += f1; rec_s += rec; faith_s += faithful; corr_s += correct
-        abst_s += float(res.abstained); lat_s += res.latency; tok_s += res.tokens
+        abst_s += float(abstained); lat_s += res.latency; tok_s += res.tokens
         details.append(QuestionDetail(
             question=ex.question, gold=ex.answer, pred=res.answer,
             em=em, f1=f1, recall=rec, faithful=faithful, correct=correct,
-            fail_type=_classify(rec, correct),
+            fail_type=_classify(rec, correct, abstained),
             retrieved_preview=" | ".join(c[:120] for c in res.retrieved_chunks[:3]),
         ))
 
-    n = len(examples)
-    return EvalScore(em=em_s / n, f1=f1_s / n, recall=rec_s / n,
-                     faithfulness=faith_s / n, correctness=corr_s / n,
-                     abstain_rate=abst_s / n,
-                     avg_latency=lat_s / n, avg_tokens=tok_s / n,
-                     n=n, details=details)
+    n_ok = len(details)
+    # 失敗題過多 (例如整段 429/5xx 風暴) -> 分數已失真，拋出且「不落 cache」，
+    # 否則壞分數會被永久快取、三種策略之後都拿它來比。
+    # 已完成的其他配置仍在 cache 裡，稍後重跑會從中斷處續跑。
+    if n_ok == 0 or errors / len(examples) > MAX_ERROR_RATE:
+        raise RuntimeError(
+            f"評估失敗題過多 ({errors}/{len(examples)})，本輪分數作廢、不寫入快取；"
+            "多半是 API 持續 429/5xx，稍後重跑即可續跑。")
+    return EvalScore(em=em_s / n_ok, f1=f1_s / n_ok, recall=rec_s / n_ok,
+                     faithfulness=faith_s / n_ok, correctness=corr_s / n_ok,
+                     abstain_rate=abst_s / n_ok,
+                     avg_latency=lat_s / n_ok, avg_tokens=tok_s / n_ok,
+                     n=n_ok, n_errors=errors, details=details)
 
 
 if __name__ == "__main__":

@@ -2,7 +2,7 @@
 # 全部走 NVIDIA NIM API，本機不需要 GPU
 openai>=1.30.0        # OpenAI 相容 client，指向 NVIDIA NIM
 rank-bm25>=0.2.2      # sparse 檢索 (BM25)，純 Python
-datasets>=2.18.0      # 載 HotpotQA
+datasets>=2.18.0      # 載 HotpotQA (用 hotpotqa/hotpot_qa parquet repo，相容 datasets 3.x+)
 numpy>=1.24.0         # 向量運算 / cosine 相似度
 python-dotenv>=1.0.0  # 讀 .env 的 NVIDIA_API_KEY
 tqdm>=4.66.0          # 進度條

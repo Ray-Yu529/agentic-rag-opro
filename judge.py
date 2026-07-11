@@ -5,18 +5,20 @@ judge.py — LLM-as-judge: NLI 忠實度 + 語意正確性
 1. faithfulness (NLI): 答案是否「完全由檢索到的 context 支持」-> 量化幻覺。
 2. correctness: 答案語意上是否等同正解 (EM/F1 對自由文本太嚴，補一個語意判官)。
 
-重要: 判官模型刻意與 RAG 生成模型不同 (JUDGE_MODEL != GEN_MODEL)，
-      否則模型會偏袒自己的答案 (self-preference bias)。
+重要: 判官模型刻意與 RAG 生成模型「不同家族」(Mixtral vs Llama)，
+      同家族大小模型仍可能有 self-preference bias。
 """
 
 from __future__ import annotations
 
+import os
 import re
 
 from rag import api_call, get_client, GEN_MODEL
 
-# 判官用大模型，且必須 != GEN_MODEL (rag.py 預設 8b) 以避免自我偏袒
-JUDGE_MODEL = "meta/llama-3.1-70b-instruct"
+# 判官與生成模型不同家族以避免自我偏袒；端點 404/不穩時可在 .env 用
+# JUDGE_MODEL 覆寫 (建議仍選非 Llama 家族)。
+JUDGE_MODEL = os.environ.get("JUDGE_MODEL", "mistralai/mixtral-8x7b-instruct-v0.1")
 
 assert JUDGE_MODEL != GEN_MODEL, "判官模型不可與生成模型相同 (會自我偏袒)"
 

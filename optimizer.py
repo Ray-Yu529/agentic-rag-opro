@@ -15,16 +15,20 @@ optimizer.py — 搜索空間 + 多目標 + random baseline (D3) + OPRO 迴路 (
 from __future__ import annotations
 
 import json
+import os
 import re
 import random
 from itertools import product
+
+from openai import BadRequestError
 
 from rag import RagConfig, api_call, get_client
 from cache import ResultCache, config_to_dict, dict_to_config
 from memory.trajectory import Trajectory, Trial
 
-META_MODEL = "nvidia/llama-3.1-nemotron-70b-instruct"  # meta-optimizer (推理量小)
-LAMBDA = 0.5  # 幻覺懲罰權重
+# meta-optimizer (推理量小)；端點不穩時可在 .env 用 META_MODEL 覆寫
+META_MODEL = os.environ.get("META_MODEL", "nvidia/llama-3.1-nemotron-70b-instruct")
+DEFAULT_LAMBDA = 0.5  # 幻覺懲罰權重預設值 (各 search 函式可用 lam 參數覆寫)
 
 
 def chat_json(prompt: str, temperature: float, max_tokens: int) -> dict:
@@ -37,7 +41,7 @@ def chat_json(prompt: str, temperature: float, max_tokens: int) -> dict:
     try:
         resp = api_call(client.chat.completions.create,
                         response_format={"type": "json_object"}, **kwargs)
-    except Exception:  # noqa: BLE001 — 端點不支援 JSON mode 時退回一般模式
+    except BadRequestError:  # 端點不支援 JSON mode (400) 才退回一般模式；其他錯誤照拋
         resp = api_call(client.chat.completions.create, **kwargs)
     m = re.search(r"\{.*\}", resp.choices[0].message.content, re.DOTALL)
     if not m:
@@ -72,17 +76,17 @@ def is_valid(d: dict) -> bool:
         return False
 
 
-def objective(score: dict) -> float:
+def objective(score: dict, lam: float = DEFAULT_LAMBDA) -> float:
     """多目標純量化: 正確率 - λ·幻覺率。"""
     hallucination = 1.0 - score.get("faithfulness", 1.0)
-    return score.get("correctness", 0.0) - LAMBDA * hallucination
+    return score.get("correctness", 0.0) - lam * hallucination
 
 
-def _trial(record: dict, source: str) -> Trial:
+def _trial(record: dict, source: str, lam: float) -> Trial:
     return Trial(config=record["config"], score=record["score"],
-                 objective=objective(record["score"]),
+                 objective=objective(record["score"], lam),
                  failures=record["failures"], source=source,
-                 lam=LAMBDA)  # 記下當時的 λ，避免不同權重的軌跡混著比
+                 lam=lam)  # 記下當時的 λ，避免不同權重的軌跡混著比
 
 
 def _make_say(log_fn, verbose):
@@ -94,7 +98,8 @@ def _make_say(log_fn, verbose):
 
 # --- D3: Random search baseline -------------------------------------------
 def random_search(examples, cache: ResultCache, budget: int, seed: int,
-                  traj_path: str, verbose: bool = True, log_fn=None) -> Trajectory:
+                  traj_path: str, verbose: bool = True, log_fn=None,
+                  lam: float = DEFAULT_LAMBDA) -> Trajectory:
     say = _make_say(log_fn, verbose)
     rng = random.Random(seed)
     grid = all_configs()
@@ -103,13 +108,28 @@ def random_search(examples, cache: ResultCache, budget: int, seed: int,
     traj.reset()
     for cfg in grid[:budget]:
         rec = cache.evaluate_cached(cfg, examples, verbose=verbose)
-        traj.add(_trial(rec, source="random"))
-        say(f"[random] 評估 {config_to_dict(cfg)} -> obj={objective(rec['score']):.3f}")
+        traj.add(_trial(rec, source="random", lam=lam))
+        say(f"[random] 評估 {config_to_dict(cfg)} -> obj={objective(rec['score'], lam):.3f}")
     return traj
 
 
 # --- D4: OPRO meta-optimizer -----------------------------------------------
-def _build_meta_prompt(traj: Trajectory, cache: ResultCache) -> str:
+def _marginal_lines(traj: Trajectory) -> str:
+    """每個參數取值的平均 objective (已試樣本內的邊際統計)，
+    讓 meta LLM 的診斷有數據支撐，而不是只看排行榜猜。"""
+    lines = []
+    for dim, values in SEARCH_SPACE.items():
+        parts = []
+        for v in values:
+            objs = [t.objective for t in traj.trials if t.config.get(dim) == v]
+            parts.append(f"{v}→{sum(objs) / len(objs):.3f}(n={len(objs)})"
+                         if objs else f"{v}→未試")
+        lines.append(f"  {dim}: " + ", ".join(parts))
+    return "\n".join(lines)
+
+
+def _build_meta_prompt(traj: Trajectory, cache: ResultCache,
+                       lam: float = DEFAULT_LAMBDA) -> str:
     ranked = sorted(traj.trials, key=lambda t: t.objective, reverse=True)
     lines = []
     for rank, t in enumerate(ranked, 1):
@@ -142,7 +162,7 @@ def _build_meta_prompt(traj: Trajectory, cache: ResultCache) -> str:
     tried = ", ".join(sorted(
         "|".join(str(t.config[k]) for k in SEARCH_SPACE) for t in traj.trials))
 
-    return f"""你是 RAG 系統最佳化架構師。目標: 最大化 objective = 正確率 - {LAMBDA}×幻覺率。
+    return f"""你是 RAG 系統最佳化架構師。目標: 最大化 objective = 正確率 - {lam}×幻覺率。
 
 合法參數值 (提案必須從這裡選):
   chunk_size      ∈ {SEARCH_SPACE['chunk_size']}
@@ -155,7 +175,11 @@ def _build_meta_prompt(traj: Trajectory, cache: ResultCache) -> str:
 已測配置 (依 objective 由高到低):
 {table}
 
-目前最佳配置的失敗分群: {clusters}  (retrieval=檢索沒撈全, generation=撈到卻答錯)
+各參數取值的平均 objective (已測樣本內的邊際統計，樣本少僅供參考):
+{_marginal_lines(traj)}
+
+目前最佳配置的失敗分群: {clusters}
+(retrieval=檢索沒撈全, generation=撈到卻答錯, abstain=守門員/生成器棄答)
 代表失敗題:
 {fails}
 
@@ -188,14 +212,17 @@ def _config_from_proposal(d: dict) -> RagConfig:
     )
 
 
-def _pick_valid_untried(proposals: list[dict], tried: set[tuple]) -> RagConfig | None:
+def _valid_untried(proposals: list[dict], tried: set[tuple]) -> list[RagConfig]:
+    """合法且未測過的提案 (含提案間去重)。"""
+    out, seen = [], set(tried)
     for d in proposals:
         if not is_valid(d):
             continue
         cfg = _config_from_proposal(d)
-        if cfg.key() not in tried:
-            return cfg
-    return None
+        if cfg.key() not in seen:
+            seen.add(cfg.key())
+            out.append(cfg)
+    return out
 
 
 def _random_untried(tried: set[tuple], rng: random.Random) -> RagConfig | None:
@@ -204,7 +231,8 @@ def _random_untried(tried: set[tuple], rng: random.Random) -> RagConfig | None:
 
 
 def opro_search(examples, cache: ResultCache, budget: int, seed: int, traj_path: str,
-                n_init: int = 3, verbose: bool = True, log_fn=None) -> Trajectory:
+                n_init: int = 3, verbose: bool = True, log_fn=None,
+                lam: float = DEFAULT_LAMBDA) -> Trajectory:
     say = _make_say(log_fn, verbose)
     rng = random.Random(seed)
     grid = all_configs()
@@ -216,23 +244,28 @@ def opro_search(examples, cache: ResultCache, budget: int, seed: int, traj_path:
     # 暖身: 與 random baseline 相同 seed 的前 n_init 組 (公平起跑)
     for cfg in grid[:n_init]:
         rec = cache.evaluate_cached(cfg, examples, verbose=verbose)
-        traj.add(_trial(rec, source="init"))
-        say(f"[暖身] {config_to_dict(cfg)} -> obj={objective(rec['score']):.3f}")
+        traj.add(_trial(rec, source="init", lam=lam))
+        say(f"[暖身] {config_to_dict(cfg)} -> obj={objective(rec['score'], lam):.3f}")
 
     while len(traj.trials) < budget:
-        result = _call_meta(_build_meta_prompt(traj, cache))
+        result = _call_meta(_build_meta_prompt(traj, cache, lam))
         say(f"\n[OPRO 第 {len(traj.trials) - n_init + 1} 輪] 推理: "
             f"{result.get('reasoning', '')}")
         tried = traj.tried_keys()
-        cfg = _pick_valid_untried(result.get("proposals", []), tried)
-        if cfg is None:
+        # prompt 允許最多 2 組提案；兩組都評，讓每次 meta 呼叫的成本攤平
+        cfgs = _valid_untried(result.get("proposals", []), tried)[:2]
+        if not cfgs:
             cfg = _random_untried(tried, rng)
             if cfg is None:
                 break
             say("  (LLM 無有效提案，後備隨機抽)")
-        say(f"  -> 採用 {config_to_dict(cfg)}")
-        rec = cache.evaluate_cached(cfg, examples, verbose=verbose)
-        traj.add(_trial(rec, source="opro"))
-        say(f"  -> obj={objective(rec['score']):.3f}")
+            cfgs = [cfg]
+        for cfg in cfgs:
+            if len(traj.trials) >= budget:
+                break
+            say(f"  -> 採用 {config_to_dict(cfg)}")
+            rec = cache.evaluate_cached(cfg, examples, verbose=verbose)
+            traj.add(_trial(rec, source="opro", lam=lam))
+            say(f"  -> obj={objective(rec['score'], lam):.3f}")
 
     return traj

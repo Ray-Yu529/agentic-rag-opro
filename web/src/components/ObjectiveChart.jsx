@@ -30,8 +30,10 @@ export default function ObjectiveChart({ strategies }) {
           <Tooltip />
           <Legend />
           {names.map((n) => (
+            /* 各策略可能用不同 λ 跑 (objective 定義不同)，標進圖例避免誤比 */
             <Line key={n} type="stepAfter" dataKey={n} stroke={COLORS[n] || "#3366cc"}
-                  strokeWidth={2} dot={{ r: 3 }} connectNulls />
+                  strokeWidth={2} dot={{ r: 3 }} connectNulls
+                  name={strategies[n].lam != null ? `${n} (λ=${strategies[n].lam})` : n} />
           ))}
         </LineChart>
       </ResponsiveContainer>

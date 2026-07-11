@@ -22,12 +22,12 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-import optimizer
 from eval import load_hotpot
 from cache import DEFAULT_DATASET, ResultCache, dataset_key
-from optimizer import random_search, opro_search, objective
+from optimizer import DEFAULT_LAMBDA, random_search, opro_search
 from hybrid import hybrid_search
 from memory.trajectory import Trajectory
+from pareto import pareto_front
 
 load_dotenv()
 
@@ -39,7 +39,8 @@ app.add_middleware(
 
 # --- 全域任務狀態 (Demo: 一次跑一個) --------------------------------------
 STATE: dict = {"running": False, "strategy": None, "done": 0, "total": 0,
-               "log": [], "error": None, "dataset": DEFAULT_DATASET}
+               "log": [], "error": None, "dataset": DEFAULT_DATASET,
+               "lam": DEFAULT_LAMBDA}
 _lock = threading.Lock()
 
 
@@ -65,14 +66,15 @@ def _log(msg: str) -> None:
 
 def _job(req: RunReq) -> None:
     try:
-        optimizer.LAMBDA = req.lam  # 即時調整目標權重 (λ 會記進每筆 Trial)
         n_hard = min(req.n_hard, req.n)
         examples = _load_examples(req.n, n_hard)
         # 快取鍵含測試集 fingerprint: 改題數後不會沿用到舊測試集的分數
         cache = ResultCache(dataset=dataset_key(req.n, n_hard))
         traj_path = str(RESULTS / f"{req.strategy}.jsonl")
+        # λ 以參數傳入 (不動全域狀態)，且會記進每筆 Trial
         common = dict(examples=examples, cache=cache, budget=req.budget,
-                      seed=42, traj_path=traj_path, verbose=False, log_fn=_log)
+                      seed=42, traj_path=traj_path, verbose=False, log_fn=_log,
+                      lam=req.lam)
         if req.strategy == "random":
             random_search(**common)
         elif req.strategy == "hybrid":
@@ -96,7 +98,8 @@ def run(req: RunReq):
             return {"ok": False, "msg": "已有任務在執行"}
         STATE.update(running=True, strategy=req.strategy, done=0,
                      total=req.budget, log=[], error=None,
-                     dataset=dataset_key(req.n, min(req.n_hard, req.n)))
+                     dataset=dataset_key(req.n, min(req.n_hard, req.n)),
+                     lam=req.lam)
     threading.Thread(target=_job, args=(req,), daemon=True).start()
     return {"ok": True}
 
@@ -112,16 +115,6 @@ def status():
         if p.exists():
             done = sum(1 for _ in p.read_text(encoding="utf-8").splitlines() if _.strip())
     return {**snapshot, "done": done}
-
-
-def _pareto(points):
-    pts = sorted(points, key=lambda p: (p["hallucination"], -p["correctness"]))
-    front, best = [], -1.0
-    for p in pts:
-        if p["correctness"] > best:
-            front.append(p)
-            best = p["correctness"]
-    return front
 
 
 @app.get("/api/results")
@@ -149,12 +142,17 @@ def results():
     # Pareto 只取「目前這個測試集」的 record，不同題數的分數不混著畫
     with _lock:
         dataset = STATE["dataset"]
+        lam = STATE["lam"]
     cache = ResultCache(dataset=dataset)
     pts = [{"key": r["config"], "hallucination": 1 - r["score"]["faithfulness"],
             "correctness": r["score"]["correctness"]} for r in cache.all_records()]
+    front_set = set(pareto_front([(p["hallucination"], p["correctness"]) for p in pts]))
+    front = sorted((p for p in pts
+                    if (p["hallucination"], p["correctness"]) in front_set),
+                   key=lambda p: (p["hallucination"], -p["correctness"]))
     return {"strategies": strategies, "best": overall_best,
-            "pareto": {"points": pts, "front": _pareto(pts)},
-            "lam": optimizer.LAMBDA}
+            "pareto": {"points": pts, "front": front},
+            "lam": lam}
 
 
 if __name__ == "__main__":

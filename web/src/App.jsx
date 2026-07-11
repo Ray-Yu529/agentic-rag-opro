@@ -25,12 +25,16 @@ export default function App() {
   useEffect(() => {
     if (!running) return;
     timer.current = setInterval(async () => {
-      const st = await getStatus();
-      setStatus(st);
-      refreshResults();
-      if (!st.running) {
-        setRunning(false);
-        clearInterval(timer.current);
+      try {
+        const st = await getStatus();
+        setStatus(st);
+        refreshResults();
+        if (!st.running) {
+          setRunning(false);
+          clearInterval(timer.current);
+        }
+      } catch {
+        // 後端暫時連不上 (重啟/網路抖動): 跳過這一輪，下一輪再試
       }
     }, 1500);
     return () => clearInterval(timer.current);
