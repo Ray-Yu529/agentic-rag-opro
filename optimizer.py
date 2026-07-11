@@ -31,11 +31,13 @@ META_MODEL = os.environ.get("META_MODEL", "nvidia/llama-3.1-nemotron-70b-instruc
 DEFAULT_LAMBDA = 0.5  # 幻覺懲罰權重預設值 (各 search 函式可用 lam 參數覆寫)
 
 
-def chat_json(prompt: str, temperature: float, max_tokens: int) -> dict:
-    """呼叫 meta LLM 並解析 JSON。優先用 API 的 JSON mode；
-    模型不支援時退回一般模式 + regex 擷取。解析失敗回 {}。"""
+def chat_json(prompt: str, temperature: float, max_tokens: int,
+              model: str = META_MODEL) -> dict:
+    """呼叫 LLM 並解析 JSON (預設 meta 模型，dataset.py 的 QA 生成也共用)。
+    優先用 API 的 JSON mode；模型不支援時退回一般模式 + regex 擷取。
+    解析失敗回 {}。"""
     client = get_client()
-    kwargs = dict(model=META_MODEL,
+    kwargs = dict(model=model,
                   messages=[{"role": "user", "content": prompt}],
                   temperature=temperature, max_tokens=max_tokens)
     try:

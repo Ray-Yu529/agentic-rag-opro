@@ -8,6 +8,7 @@ oracle.json
 cache.json
 results/
 *.png
+data/          # 自訂語料 + 生成的 QA (使用者資料不入庫)
 
 # 前端
 web/node_modules/

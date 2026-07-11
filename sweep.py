@@ -11,17 +11,22 @@ agentic 開關 (rerank/decompose/verify) 的效益交給 run.py 的最佳化器�
 
 from __future__ import annotations
 
+import argparse
+import json
 from math import comb
+from pathlib import Path
 
 from dotenv import load_dotenv
 from tqdm import tqdm
 
 from rag import RagConfig
 from eval import load_hotpot
-from cache import ResultCache, dataset_key
+from cache import ResultCache, dataset_key, custom_dataset_key
 from optimizer import SEARCH_SPACE
 
 load_dotenv()
+
+RESULTS = Path(__file__).parent / "results"
 
 
 def _sign_test_p(b: int, c: int) -> float:
@@ -41,9 +46,27 @@ def base_grid() -> list[RagConfig]:
             for r in SEARCH_SPACE["retriever"]]
 
 
-def main(n: int = 30, n_hard: int = 15) -> None:
-    examples = load_hotpot(n=n, n_hard=n_hard)
-    cache = ResultCache(dataset=dataset_key(n, n_hard))
+def main(n: int = 30, n_hard: int = 15,
+         corpus: str | None = None, qa_path: str | None = None) -> None:
+    if corpus:
+        if not qa_path:
+            raise SystemExit(
+                "--corpus 需要搭配 --qa。先生成:\n"
+                f"  python dataset.py --corpus {corpus} --n 20 --out data/qa.jsonl")
+        from dataset import load_corpus, load_qa, build_examples, dataset_fingerprint
+        paragraphs = load_corpus(corpus)
+        qa = load_qa(qa_path)
+        examples = build_examples(paragraphs, qa, seed=42, log_fn=print)
+        dkey = custom_dataset_key(dataset_fingerprint(paragraphs, qa),
+                                  len(examples), 42)
+    else:
+        examples = load_hotpot(n=n, n_hard=n_hard)
+        dkey = dataset_key(n, n_hard)
+    cache = ResultCache(dataset=dkey)
+    # 記下 dataset key，run.py 沒跑過時 plot.py 也取得到同一批 record
+    RESULTS.mkdir(parents=True, exist_ok=True)
+    (RESULTS / "meta.json").write_text(
+        json.dumps({"dataset": dkey}, ensure_ascii=False), encoding="utf-8")
     configs = base_grid()
     print(f"載入 {len(examples)} 題，掃描核心網格 {len(configs)} 組 (agentic 全關)\n")
 
@@ -82,4 +105,8 @@ def main(n: int = 30, n_hard: int = 15) -> None:
 
 
 if __name__ == "__main__":
-    main()
+    ap = argparse.ArgumentParser(description="核心網格掃描 + go/no-go")
+    ap.add_argument("--corpus", help="自訂語料: .txt/.md 檔或資料夾 (不給則用 HotpotQA)")
+    ap.add_argument("--qa", help="自訂 QA jsonl (與 --corpus 併用)")
+    args = ap.parse_args()
+    main(corpus=args.corpus, qa_path=args.qa)

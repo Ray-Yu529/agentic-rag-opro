@@ -4,17 +4,23 @@ run.py — 主編排: random vs OPRO vs hybrid 對照 (多目標)
 搜索空間 216 組，三種策略各用 BUDGET 次評估去找最佳配置。
 分數查共用 cache.json (查過不重跑)，OPRO/hybrid 額外呼叫 meta-LLM 推理。
 
-產出 results/*.jsonl，之後跑 plot.py 出對比曲線 + Pareto 圖。
+資料集二選一:
+  預設                      HotpotQA 分層子集 (N/N_HARD)
+  --corpus PATH --qa PATH   你自己的文件 + QA (QA 先用 dataset.py 生成或自備)
+
+產出 results/*.jsonl + results/meta.json，之後跑 plot.py 出對比曲線 + Pareto 圖。
 """
 
 from __future__ import annotations
 
+import argparse
+import json
 from pathlib import Path
 
 from dotenv import load_dotenv
 
 from eval import load_hotpot
-from cache import ResultCache, dataset_key
+from cache import ResultCache, dataset_key, custom_dataset_key
 from optimizer import random_search, opro_search
 from hybrid import hybrid_search
 
@@ -24,7 +30,35 @@ RESULTS = Path(__file__).parent / "results"
 BUDGET = 10    # 每種策略的評估次數 (216 組裡只試 10 組)
 SEED = 42
 N_INIT = 3     # 暖身組數 (三種策略同 seed，公平起跑)
-N, N_HARD = 30, 15   # 測試集大小 (需與 sweep.py 一致才能共用 cache)
+N, N_HARD = 30, 15   # HotpotQA 測試集大小 (需與 sweep.py 一致才能共用 cache)
+
+
+def parse_args() -> argparse.Namespace:
+    ap = argparse.ArgumentParser(description="random vs OPRO vs hybrid 對照")
+    ap.add_argument("--corpus", help="自訂語料: .txt/.md 檔或資料夾 (不給則用 HotpotQA)")
+    ap.add_argument("--qa", help="自訂 QA jsonl (與 --corpus 併用；"
+                                 "先跑 python dataset.py --corpus ... 生成，或自備)")
+    ap.add_argument("--n", type=int, default=None,
+                    help="題數 (custom 預設用全部 QA；hotpot 固定用 N=30)")
+    return ap.parse_args()
+
+
+def load_examples_and_key(args) -> tuple[list, str]:
+    """回傳 (examples, cache 的 dataset key)。custom 與 hotpot 共用同一條下游管線。"""
+    if args.corpus:
+        if not args.qa:
+            raise SystemExit(
+                "--corpus 需要搭配 --qa。先生成:\n"
+                f"  python dataset.py --corpus {args.corpus} --n 20 --out data/qa.jsonl")
+        from dataset import load_corpus, load_qa, build_examples, dataset_fingerprint
+        paragraphs = load_corpus(args.corpus)
+        qa = load_qa(args.qa)
+        examples = build_examples(paragraphs, qa, n=args.n, seed=SEED, log_fn=print)
+        key = custom_dataset_key(dataset_fingerprint(paragraphs, qa),
+                                 len(examples), SEED)
+        print(f"自訂資料集: {len(paragraphs)} 段語料, {len(examples)} 題")
+        return examples, key
+    return load_hotpot(n=N, n_hard=N_HARD), dataset_key(N, N_HARD, SEED)
 
 
 def summarize(name: str, traj) -> None:
@@ -38,9 +72,14 @@ def summarize(name: str, traj) -> None:
 
 
 def main() -> None:
-    examples = load_hotpot(n=N, n_hard=N_HARD)
-    # 與 sweep 共用; 已掃過的核心網格在這免費重用 (快取鍵含測試集 fingerprint)
-    cache = ResultCache(dataset=dataset_key(N, N_HARD, SEED))
+    args = parse_args()
+    examples, dkey = load_examples_and_key(args)
+    # 與 sweep 共用; 已掃過的配置在這免費重用 (快取鍵含測試集+評估指紋)
+    cache = ResultCache(dataset=dkey)
+    # 記下本次的 dataset key，plot.py 的 Pareto 圖才會取到同一批 record
+    RESULTS.mkdir(parents=True, exist_ok=True)
+    (RESULTS / "meta.json").write_text(
+        json.dumps({"dataset": dkey}, ensure_ascii=False), encoding="utf-8")
 
     print("=== Random search baseline ===")
     rand = random_search(examples, cache, budget=BUDGET, seed=SEED,

@@ -10,6 +10,9 @@ import Leaderboard from "./components/Leaderboard.jsx";
 export default function App() {
   const [params, setParams] = useState({
     strategy: "opro", n: 20, n_hard: 10, budget: 8, lam: 0.5,
+    dataset_mode: "hotpot",   // hotpot | custom
+    corpus_text: "",          // custom: 文件全文 (多檔已串接)
+    qa: null,                 // custom: 自備 QA; null = 用 LLM 生成 n 題
   });
   const [status, setStatus] = useState(null);
   const [results, setResults] = useState(null);

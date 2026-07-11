@@ -45,6 +45,12 @@ def dataset_key(n: int, n_hard: int, seed: int = 42) -> str:
     return f"hotpot|n={n}|hard={n_hard}|seed={seed}|ev={_eval_fingerprint()}"
 
 
+def custom_dataset_key(fingerprint: str, n: int, seed: int = 42) -> str:
+    """自訂資料集 (使用者文件+QA) 的快取鍵。
+    fingerprint = dataset.dataset_fingerprint(語料, QA)，改內容自動失效。"""
+    return f"custom|fp={fingerprint}|n={n}|seed={seed}|ev={_eval_fingerprint()}"
+
+
 DEFAULT_DATASET = dataset_key(30, 15, 42)   # CLI (sweep/run/plot) 的預設測試集
 
 

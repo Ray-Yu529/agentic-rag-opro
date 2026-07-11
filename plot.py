@@ -9,6 +9,7 @@ plot.py — D5: 對比曲線 + 多目標 Pareto 圖
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -17,9 +18,18 @@ import matplotlib.pyplot as plt
 plt.rcParams["font.sans-serif"] = ["Microsoft JhengHei", "Microsoft YaHei", "SimHei"]
 plt.rcParams["axes.unicode_minus"] = False
 
-from cache import ResultCache
+from cache import DEFAULT_DATASET, ResultCache
 from memory.trajectory import Trajectory
 from pareto import pareto_front
+
+
+def _last_dataset() -> str:
+    """run.py/sweep.py 記在 meta.json 的 dataset key (自訂資料集也能畫對 Pareto)。"""
+    meta = RESULTS / "meta.json"
+    if meta.exists():
+        return json.loads(meta.read_text(encoding="utf-8")).get(
+            "dataset", DEFAULT_DATASET)
+    return DEFAULT_DATASET
 
 RESULTS = Path(__file__).parent / "results"
 STRATEGIES = {"random.jsonl": ("Random", "#888", "o"),
@@ -49,8 +59,8 @@ def main() -> None:
     ax1.set_title("最佳化效率: 越快越高越好")
     ax1.legend(); ax1.grid(alpha=0.3)
 
-    # --- 右: Pareto (用 cache 裡所有試過的配置) ---
-    cache = ResultCache()
+    # --- 右: Pareto (用 cache 裡「同一測試集」所有試過的配置) ---
+    cache = ResultCache(dataset=_last_dataset())
     pts = [(1 - r["score"]["faithfulness"], r["score"]["correctness"])
            for r in cache.all_records()]
     if pts:
