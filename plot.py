@@ -33,9 +33,10 @@ def _last_meta() -> dict:
     return {}
 
 RESULTS = Path(__file__).parent / "results"
-STRATEGIES = {"random.jsonl": ("Random", "#888", "o"),
-              "opro.jsonl": ("OPRO", "#d1495b", "s"),
-              "hybrid.jsonl": ("Hybrid", "#2e7d32", "^")}
+# 與 Web UI 同一套系列色 (CVD/對比已驗證): opro=blue, hybrid=aqua, random=中性灰
+STRATEGIES = {"random.jsonl": ("Random", "#898781", "o"),
+              "opro.jsonl": ("OPRO", "#2a78d6", "s"),
+              "hybrid.jsonl": ("Hybrid", "#1baf7a", "^")}
 
 
 def _load_curves(base: str, seeds: list[int]) -> tuple[list[list[float]], float | None]:
@@ -80,19 +81,24 @@ def main() -> None:
     ax1.set_title("最佳化效率: 越快越高越好")
     ax1.legend(); ax1.grid(alpha=0.3)
 
-    # --- 右: Pareto (用 cache 裡「同一測試集」所有試過的配置) ---
+    # --- 右: Pareto，三目標視覺化 (第三軸 = 成本，用點大小編碼) ---
     cache = ResultCache(dataset=meta.get("dataset", DEFAULT_DATASET))
+    records = cache.all_records()
     pts = [(1 - r["score"]["faithfulness"], r["score"]["correctness"])
-           for r in cache.all_records()]
+           for r in records]
     if pts:
+        toks = np.array([r["score"].get("avg_tokens", 0) for r in records], dtype=float)
+        span = toks.max() - toks.min()
+        sizes = 25 + 155 * (toks - toks.min()) / (span if span > 0 else 1)
         xs, ys = zip(*pts)
-        ax2.scatter(xs, ys, alpha=0.4, color="#888", label="all configs")
+        ax2.scatter(xs, ys, s=sizes, alpha=0.45, color="#898781",
+                    label="all configs (點大小=每題 tokens)")
         front = pareto_front(pts)
         fx, fy = zip(*front)
-        ax2.plot(fx, fy, "r-o", label="Pareto front")
+        ax2.plot(fx, fy, "-o", color="#2a78d6", label="Pareto front")
     ax2.set_xlabel("幻覺率 (越低越好) →")
     ax2.set_ylabel("正確率 (越高越好) →")
-    ax2.set_title("多目標權衡: 正確率 vs 幻覺率")
+    ax2.set_title("三目標權衡: 正確率 vs 幻覺率 (大小=成本)")
     ax2.legend(); ax2.grid(alpha=0.3)
 
     fig.tight_layout()

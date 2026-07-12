@@ -47,9 +47,8 @@ class Trajectory:
 
     def tried_keys(self) -> set[tuple]:
         """已試過的 config key，供去重 (放程式裡，不靠 prompt)。"""
-        fields = ("chunk_size", "top_k", "retriever", "chunk_overlap",
-                  "rerank", "query_decompose", "verify")
-        return {tuple(t.config.get(f) for f in fields) for t in self.trials}
+        from cache import CONFIG_FIELDS  # 局部 import: 與快取鍵共用維度定義
+        return {tuple(t.config.get(f) for f in CONFIG_FIELDS) for t in self.trials}
 
     def best(self) -> Trial | None:
         return max(self.trials, key=lambda t: t.objective) if self.trials else None

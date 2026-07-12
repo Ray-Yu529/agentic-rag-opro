@@ -17,6 +17,7 @@ import base64
 import hashlib
 import html
 import json
+import os
 import threading
 import time
 from functools import lru_cache
@@ -26,6 +27,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from eval import load_hotpot
@@ -257,7 +259,9 @@ def results():
         mu = STATE["mu"]
     cache = ResultCache(dataset=dataset)
     pts = [{"key": r["config"], "hallucination": 1 - r["score"]["faithfulness"],
-            "correctness": r["score"]["correctness"]} for r in cache.all_records()]
+            "correctness": r["score"]["correctness"],
+            "tokens": round(r["score"].get("avg_tokens", 0))}   # 第三目標: 成本
+           for r in cache.all_records()]
     front_set = set(pareto_front([(p["hallucination"], p["correctness"]) for p in pts]))
     front = sorted((p for p in pts
                     if (p["hallucination"], p["correctness"]) in front_set),
@@ -305,8 +309,7 @@ def report(run_id: str):
     trial_rows = "".join(
         "<tr><td>{}</td><td>{}</td><td>{:.0%}</td><td>{:.0%}</td><td>{:.3f}</td></tr>".format(
             _esc(t["source"]),
-            _esc(", ".join(f"{k}={v}" for k, v in t["config"].items()
-                           if k != "chunk_overlap")),
+            _esc(", ".join(f"{k}={v}" for k, v in t["config"].items())),
             t["score"].get("correctness", 0), 1 - t["score"].get("faithfulness", 1),
             t["objective"])
         for t in sorted(row["trials"], key=lambda t: -t["objective"]))
@@ -336,6 +339,15 @@ def report(run_id: str):
 </body></html>""")
 
 
+# Docker/單容器部署: 前端 build 後由 FastAPI 直接服務 (web/dist 存在才掛)。
+# 開發時仍走 Vite dev server (:5173 proxy 到這裡)，不受影響。
+_DIST = Path(__file__).parent / "web" / "dist"
+if _DIST.exists():
+    app.mount("/", StaticFiles(directory=str(_DIST), html=True), name="web")
+
+
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="127.0.0.1", port=8000)
+    # Docker 內設 HOST=0.0.0.0；本機開發維持 127.0.0.1
+    uvicorn.run(app, host=os.environ.get("HOST", "127.0.0.1"),
+                port=int(os.environ.get("PORT", "8000")))

@@ -2,10 +2,14 @@
 
 const KNOBS = [
   ["chunk_size", "Chunk 大小"],
+  ["chunk_overlap", "Chunk 重疊"],
   ["top_k", "檢索段數"],
   ["retriever", "檢索器"],
+  ["hybrid_alpha", "混合權重 α"],
   ["rerank", "重排"],
   ["query_decompose", "查詢分解"],
+  ["hyde", "HyDE 改寫"],
+  ["iterative", "迭代檢索"],
   ["verify", "NLI 守門員"],
 ];
 

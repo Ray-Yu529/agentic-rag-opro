@@ -64,8 +64,11 @@ export default function App() {
   return (
     <div className="app">
       <header>
-        <h1>Agentic RAG + OPRO 調參台</h1>
-        <p>填表單 → 按執行 → 看圖表，不用碰 CLI 或 JSON。</p>
+        <div className="brand-mark">🎛️</div>
+        <div>
+          <h1>Agentic RAG + OPRO 調參台</h1>
+          <p>填表單 → 按執行 → 看圖表，不用碰 CLI 或 JSON。</p>
+        </div>
       </header>
 
       <div className="layout">

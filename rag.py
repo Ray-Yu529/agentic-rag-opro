@@ -2,11 +2,15 @@
 rag.py — 被優化的 Agentic RAG 系統
 
 被 OPRO 優化的配置 = RagConfig:
-  數值/離散: chunk_size, top_k, retriever
+  數值/離散: chunk_size, chunk_overlap, top_k,
+             retriever (bm25/dense/hybrid/graph), hybrid_alpha (dense 權重)
   agentic 開關:
-    rerank          — 檢索後用 dense 相似度對候選重排，再取 top_k
+    rerank          — 檢索後用專用 reranker 模型對候選重排，再取 top_k
     query_decompose — 多跳問題先拆成子問題各自檢索 (HotpotQA 是多跳)
+    hyde            — 生成一句假設答案當額外查詢 (HyDE)
+    iterative       — 看第一輪 context 缺什麼、追加查詢再檢索一輪
     verify          — 生成後做 NLI 忠實度自我檢查，不過關就重檢索/棄答 (降幻覺)
+  graph 檢索 = graph-lite GraphRAG: 實體共現圖 + 種子鄰居擴展 (零建圖 API 成本)
 
 所有模型呼叫走 NVIDIA NIM (OpenAI 相容)，本機不需要 GPU。
 檢索是 per-question: HotpotQA 每題自帶 context，故可算 retrieval recall。
@@ -96,15 +100,19 @@ def api_call(fn, *args, retries: int = 5, base_delay: float = 2.0, **kwargs):
 class RagConfig:
     chunk_size: int = 512
     top_k: int = 5
-    retriever: str = "hybrid"          # "bm25" | "dense" | "hybrid"
+    retriever: str = "hybrid"          # "bm25" | "dense" | "hybrid" | "graph"
     chunk_overlap: int = 0
+    hybrid_alpha: float = 0.5          # hybrid/graph 的 dense 權重 (bm25 = 1-α)
     rerank: bool = False               # agentic: 檢索後重排
     query_decompose: bool = False      # agentic: 多跳拆解
+    hyde: bool = False                 # agentic: 生成假設答案當額外查詢 (HyDE)
+    iterative: bool = False            # agentic: 看缺什麼、再檢索一輪
     verify: bool = False               # agentic: NLI 自我檢查守門員
 
     def key(self) -> tuple:
         return (self.chunk_size, self.top_k, self.retriever, self.chunk_overlap,
-                self.rerank, self.query_decompose, self.verify)
+                self.hybrid_alpha, self.rerank, self.query_decompose,
+                self.hyde, self.iterative, self.verify)
 
 
 # --- 1. Chunking -----------------------------------------------------------
@@ -128,6 +136,19 @@ def make_chunks(paragraphs: list[str], cfg: RagConfig) -> list[str]:
 # --- 2. Retrievers ---------------------------------------------------------
 def _tokenize(text: str) -> list[str]:
     return text.lower().split()
+
+
+_LATIN_TOKEN = re.compile(r"[A-Za-z][A-Za-z0-9\-]{3,}")
+_CJK_RUN = re.compile(r"[一-鿿]{2,}")
+
+
+def key_tokens(text: str) -> set[str]:
+    """「稀有 token 候選」: 拉丁字 (≥4 字元) + CJK 連續片段的 2-gram。
+    graph 檢索的實體共現邊與 dataset.py 的多跳 QA 配對共用這個定義。"""
+    toks = {t.lower() for t in _LATIN_TOKEN.findall(text)}
+    for run in _CJK_RUN.findall(text):
+        toks.update(run[i:i + 2] for i in range(len(run) - 1))
+    return toks
 
 
 # 進程級 embedding 快取: chunk 只由 chunk_size/overlap 決定，同 chunk_size 的
@@ -193,6 +214,7 @@ class ChunkIndex:
         self._bm25: BM25Okapi | None = None
         self._doc_norm: dict[int, np.ndarray] = {}    # idx -> 正規化 chunk 向量
         self._q_cache: dict[str, np.ndarray] = {}     # 正規化後的 query 向量
+        self._adj: dict[int, set[int]] | None = None  # graph-lite 實體共現邊
         self.embed_tokens = 0                          # 成本: embedding token 累計
         self.extra_tokens = 0                          # 成本: reranker token (估算)
 
@@ -222,13 +244,56 @@ class ChunkIndex:
         indices = list(subset) if subset is not None else list(range(len(self.chunks)))
         return self._doc_matrix(indices) @ self._query_vector(query)
 
-    def scores(self, query: str, retriever: str) -> np.ndarray:
+    def _fused(self, query: str, alpha: float) -> np.ndarray:
+        """hybrid: (1-α)·bm25 + α·dense。α=0.5 等價舊版等權重 (外層會再 minmax)。
+        α 極值時短路，省掉不需要的另一路 (α=0 連 embedding 都不用打)。"""
+        if alpha <= 0.0:
+            return self.bm25_scores(query)
+        if alpha >= 1.0:
+            return self.dense_scores(query)
+        return ((1 - alpha) * _minmax(self.bm25_scores(query))
+                + alpha * _minmax(self.dense_scores(query)))
+
+    def _graph(self) -> dict[int, set[int]]:
+        """graph-lite 實體共現圖: 兩 chunk 共享「稀有 token」(只出現在少數
+        chunk 的實體/詞) 就連邊。純字面統計，不花任何 LLM/embedding 呼叫。"""
+        if self._adj is None:
+            tok_chunks: dict[str, list[int]] = {}
+            for i, c in enumerate(self.chunks):
+                for t in key_tokens(c):
+                    tok_chunks.setdefault(t, []).append(i)
+            cap = max(3, len(self.chunks) // 10)   # 高頻詞不當實體 (hub 邊爆炸)
+            adj: dict[int, set[int]] = {i: set() for i in range(len(self.chunks))}
+            for idxs in tok_chunks.values():
+                if 2 <= len(idxs) <= cap:
+                    for a in idxs:
+                        adj[a].update(b for b in idxs if b != a)
+            self._adj = adj
+        return self._adj
+
+    def graph_scores(self, query: str, alpha: float, seed_k: int,
+                     gamma: float = 0.5) -> np.ndarray:
+        """graph 檢索: hybrid 分數選種子，沿實體共現邊把「橋接 chunk」
+        (與高分種子共享實體、但自身字面/語意分數低) 拉上來。
+        多跳題的第二跳段落常是這種 —— 這正是 GraphRAG 的核心紅利。"""
+        base = _minmax(self._fused(query, alpha))
+        adj = self._graph()
+        boosted = base.copy()
+        for s in np.argsort(base)[::-1][:max(1, seed_k)]:
+            for nb in adj.get(int(s), ()):
+                boosted[nb] = max(boosted[nb], base[nb] + gamma * base[int(s)])
+        return boosted
+
+    def scores(self, query: str, retriever: str, alpha: float = 0.5,
+               seed_k: int = 5) -> np.ndarray:
         if retriever == "bm25":
             return self.bm25_scores(query)
         if retriever == "dense":
             return self.dense_scores(query)
         if retriever == "hybrid":
-            return _minmax(self.bm25_scores(query)) + _minmax(self.dense_scores(query))
+            return self._fused(query, alpha)
+        if retriever == "graph":
+            return self.graph_scores(query, alpha, seed_k)
         raise ValueError(f"未知 retriever: {retriever}")
 
 
@@ -258,6 +323,53 @@ def decompose_query(question: str) -> tuple[list[str], int]:
     subs = [_clean_subquestion(ln) for ln in resp.choices[0].message.content.splitlines()]
     subs = [s for s in subs if s]
     return (subs[:3] or [question]), tokens
+
+
+def hyde_query(question: str) -> tuple[str, int]:
+    """HyDE (agentic): 生成一句「假設答案」當額外查詢。
+    假設答案的用詞比問題更貼近文件語言，dense 檢索特別受益。"""
+    client = get_client()
+    prompt = (
+        "Write ONE short hypothetical sentence that would plausibly answer the "
+        "question, phrased as if quoted from a reference document. Output only "
+        "that sentence, in the same language as the question.\n\n"
+        f"Question: {question}"
+    )
+    resp = api_call(
+        client.chat.completions.create,
+        model=GEN_MODEL,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.3,
+        max_tokens=60,
+    )
+    tokens = resp.usage.total_tokens if resp.usage else 0
+    return resp.choices[0].message.content.strip(), tokens
+
+
+def gap_query(question: str, chunks: list[str]) -> tuple[str | None, int]:
+    """iterative (agentic): 看第一輪 context 還缺什麼資訊。
+    回傳追加查詢；context 已足夠時回 None (不做第二輪)。"""
+    client = get_client()
+    context = "\n".join(f"- {c[:300]}" for c in chunks)
+    prompt = (
+        "You will answer the QUESTION using the CONTEXT. If the context already "
+        "contains all information needed, reply exactly NONE. Otherwise reply "
+        "with ONE short search query (same language as the question) that would "
+        "find the missing information.\n\n"
+        f"CONTEXT:\n{context}\n\nQUESTION: {question}\nReply:"
+    )
+    resp = api_call(
+        client.chat.completions.create,
+        model=GEN_MODEL,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.0,
+        max_tokens=48,
+    )
+    tokens = resp.usage.total_tokens if resp.usage else 0
+    text = resp.choices[0].message.content.strip()
+    if not text or text.upper().startswith("NONE"):
+        return None, tokens
+    return text.splitlines()[0].strip(), tokens
 
 
 # --- 4. Rerank (專用 reranker 模型，失效退回 dense) --------------------------
@@ -303,7 +415,8 @@ def retrieve(index: ChunkIndex, queries: list[str], cfg: RagConfig) -> list[int]
     # 多 query: 每個 idx 取跨子問題的最高分
     best = np.full(len(chunks), -np.inf)
     for q in queries:
-        best = np.maximum(best, _minmax(index.scores(q, cfg.retriever)))
+        best = np.maximum(best, _minmax(index.scores(
+            q, cfg.retriever, alpha=cfg.hybrid_alpha, seed_k=cfg.top_k)))
 
     k = min(cfg.top_k, len(chunks))
     if not cfg.rerank:
@@ -370,7 +483,9 @@ class RagResult:
 
 
 def run_rag(question: str, paragraphs: list[str], cfg: RagConfig) -> RagResult:
-    """單題完整流程: (decompose) -> retrieve(+rerank) -> generate -> (verify)。"""
+    """單題完整流程:
+    (decompose)(hyde) -> retrieve(+rerank) -> (iterative 缺口再檢索)
+    -> generate -> (verify)。"""
     t0 = time.perf_counter()
     tokens = 0
 
@@ -378,10 +493,25 @@ def run_rag(question: str, paragraphs: list[str], cfg: RagConfig) -> RagResult:
     if cfg.query_decompose:
         queries, dt = decompose_query(question)
         tokens += dt
+    if cfg.hyde:
+        hq, ht = hyde_query(question)
+        tokens += ht
+        if hq:
+            queries = queries + [hq]   # 與原問題/子問題 max-融合
 
     chunks = make_chunks(paragraphs, cfg)
     index = ChunkIndex(chunks)
     idx = retrieve(index, queries, cfg)
+
+    if cfg.iterative and idx:
+        # 第一輪 context 缺什麼 -> 追加查詢再檢索，合併 (上限與 verify 拓寬一致)
+        gq, gt0 = gap_query(question, [chunks[i] for i in idx])
+        tokens += gt0
+        if gq:
+            merged = list(idx)
+            merged += [i for i in retrieve(index, [gq], cfg) if i not in merged]
+            idx = merged[:min(cfg.top_k + 3, len(chunks))]
+
     picked = [chunks[i] for i in idx]
     answer, gt = generate(question, picked)
     tokens += gt

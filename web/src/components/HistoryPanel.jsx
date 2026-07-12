@@ -17,7 +17,11 @@ export default function HistoryPanel({ runs }) {
             {runs.map((r) => (
               <tr key={r.run_id}>
                 <td>{r.ts}</td>
-                <td><span className="badge-sm">{r.strategy}</span></td>
+                <td>
+                  <span className="badge-sm">
+                    <span className={`dot dot-${r.strategy}`} />{r.strategy}
+                  </span>
+                </td>
                 <td>{r.params.dataset_mode === "custom" ? "自訂文件" : "HotpotQA"}</td>
                 <td>{r.params.n}</td>
                 <td>{r.params.budget}</td>

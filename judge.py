@@ -20,15 +20,21 @@ from rag import api_call, get_client, GEN_MODEL
 # JUDGE_MODEL 覆寫 (建議仍選非 Llama 家族)。
 JUDGE_MODEL = os.environ.get("JUDGE_MODEL", "mistralai/mixtral-8x7b-instruct-v0.1")
 
+# 稽核判官 (交叉驗證用): 抽查主判官的判決一致率，量化「判官本身可不可信」。
+# JUDGE_AUDIT_RATE=0 (預設) 完全關閉、零成本；設 0.2 = 抽 20% 的題做雙判官。
+AUDIT_MODEL = os.environ.get("AUDIT_MODEL", "meta/llama-3.1-8b-instruct")
+AUDIT_RATE = float(os.environ.get("JUDGE_AUDIT_RATE", "0"))
+
 assert JUDGE_MODEL != GEN_MODEL, "判官模型不可與生成模型相同 (會自我偏袒)"
+assert AUDIT_MODEL != JUDGE_MODEL, "稽核判官不可與主判官相同 (量不到分歧)"
 
 
-def _ask_yes_no(prompt: str) -> tuple[bool, int]:
+def _ask_yes_no(prompt: str, model: str = JUDGE_MODEL) -> tuple[bool, int]:
     """問判官一個是非題，回傳 (True=YES, 用掉的 token)。容忍模型多話，只抓第一個 YES/NO。"""
     client = get_client()
     resp = api_call(
         client.chat.completions.create,
-        model=JUDGE_MODEL,
+        model=model,
         messages=[{"role": "user", "content": prompt}],
         temperature=0.0,
         max_tokens=8,
@@ -59,14 +65,8 @@ def judge_faithfulness(answer: str, context_chunks: list[str]) -> tuple[float, i
     return (1.0 if yes else 0.0), tokens
 
 
-def judge_correctness(question: str, pred: str, gold: str) -> tuple[float, int]:
-    """
-    語意正確性: 預測答案是否與正解等價? (容忍措辭/格式差異)
-    回傳 (1.0 / 0.0, 用掉的 token)。
-    """
-    if not pred.strip():
-        return 0.0, 0
-    prompt = (
+def _correctness_prompt(question: str, pred: str, gold: str) -> str:
+    return (
         "You are grading a question-answering system. Decide if the PREDICTED "
         "answer is semantically equivalent to the GOLD answer (ignore phrasing, "
         "case, or extra words as long as the core answer matches).\n\n"
@@ -75,5 +75,24 @@ def judge_correctness(question: str, pred: str, gold: str) -> tuple[float, int]:
         f"PREDICTED: {pred}\n\n"
         "Is the predicted answer correct? Reply with only YES or NO."
     )
-    yes, tokens = _ask_yes_no(prompt)
+
+
+def judge_correctness(question: str, pred: str, gold: str) -> tuple[float, int]:
+    """
+    語意正確性: 預測答案是否與正解等價? (容忍措辭/格式差異)
+    回傳 (1.0 / 0.0, 用掉的 token)。
+    """
+    if not pred.strip():
+        return 0.0, 0
+    yes, tokens = _ask_yes_no(_correctness_prompt(question, pred, gold))
+    return (1.0 if yes else 0.0), tokens
+
+
+def audit_correctness(question: str, pred: str, gold: str) -> tuple[float, int]:
+    """稽核判官: 同一題、同一 prompt，換 AUDIT_MODEL 再判一次。
+    與主判官的一致率 (judge_agreement) 低 -> 判官判決不可信，該換模型。"""
+    if not pred.strip():
+        return 0.0, 0
+    yes, tokens = _ask_yes_no(_correctness_prompt(question, pred, gold),
+                              model=AUDIT_MODEL)
     return (1.0 if yes else 0.0), tokens

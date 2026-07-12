@@ -17,18 +17,24 @@ export default function Leaderboard({ strategies }) {
           <thead>
             <tr>
               <th>策略</th><th>chunk</th><th>top_k</th><th>retriever</th>
-              <th>rerank</th><th>分解</th><th>verify</th>
+              <th>rerank</th><th>HyDE</th><th>迭代</th><th>分解</th><th>verify</th>
               <th>正確率</th><th>幻覺率</th><th>obj</th>
             </tr>
           </thead>
           <tbody>
             {rows.map((r, i) => (
               <tr key={i} className={i === 0 ? "row-best" : ""}>
-                <td><span className="badge-sm">{r.strategy}</span></td>
+                <td>
+                  <span className="badge-sm">
+                    <span className={`dot dot-${r.strategy}`} />{r.strategy}
+                  </span>
+                </td>
                 <td>{r.config.chunk_size}</td>
                 <td>{r.config.top_k}</td>
                 <td>{r.config.retriever}</td>
                 <td>{fmt(r.config.rerank)}</td>
+                <td>{fmt(r.config.hyde)}</td>
+                <td>{fmt(r.config.iterative)}</td>
                 <td>{fmt(r.config.query_decompose)}</td>
                 <td>{fmt(r.config.verify)}</td>
                 <td>{(r.score.correctness * 100).toFixed(0)}%</td>

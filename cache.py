@@ -18,19 +18,25 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
 
 from rag import RagConfig, GEN_MODEL, EMBED_MODEL, RERANK_MODEL, SYSTEM_PROMPT
 from judge import JUDGE_MODEL
 
-CACHE_PATH = Path(__file__).parent / "cache.json"
+# Docker 等場景可用 CACHE_PATH 指到掛載的持久化目錄
+CACHE_PATH = Path(os.environ.get("CACHE_PATH",
+                                 Path(__file__).parent / "cache.json"))
 
-_FIELDS = ("chunk_size", "top_k", "retriever", "chunk_overlap",
-           "rerank", "query_decompose", "verify")
+# 搜索空間的全部維度 (RagConfig.key() / 快取鍵 / 軌跡去重共用這份定義)
+CONFIG_FIELDS = ("chunk_size", "top_k", "retriever", "chunk_overlap",
+                 "hybrid_alpha", "rerank", "query_decompose", "hyde",
+                 "iterative", "verify")
+_FIELDS = CONFIG_FIELDS   # 舊名
 
 # 評估邏輯/指標「語意」改動時手動 +1 (例如改判官 prompt、改 recall 定義)，
-# 讓舊 cache 全部失效。v3: CJK 正規化/字元級 F1 + 專用 reranker。
-EVAL_VERSION = 3
+# 讓舊 cache 全部失效。v4: graph 檢索/α/hyde/iterative 進搜索空間。
+EVAL_VERSION = 4
 
 
 def _eval_fingerprint() -> str:
@@ -63,12 +69,15 @@ def dict_to_config(d: dict) -> RagConfig:
 
 
 def _canonical(d: dict) -> dict:
-    """等價配置正規化: RERANK_MODEL=dense 時，dense 檢索＋無分解的 rerank
-    是恆等變換 (同一分數函數重排)，映射到 rerank=False 共用同一筆快取分數。
-    (預設用專用 reranker 模型時兩者真的不同，不做正規化。)"""
+    """等價配置正規化 (等價的配置共用同一筆快取分數，省真實評估):
+    1) hybrid_alpha 只影響 hybrid/graph；bm25/dense 下映射回預設 0.5。
+    2) RERANK_MODEL=dense 時，dense 檢索＋無分解的 rerank 是恆等變換，
+       映射到 rerank=False。(預設用專用 reranker 模型時兩者真的不同。)"""
+    if d.get("retriever") in ("bm25", "dense") and d.get("hybrid_alpha") != 0.5:
+        d = dict(d, hybrid_alpha=0.5)
     if (RERANK_MODEL == "dense" and d.get("retriever") == "dense"
             and not d.get("query_decompose") and d.get("rerank")):
-        return dict(d, rerank=False)
+        d = dict(d, rerank=False)
     return d
 
 

@@ -159,20 +159,14 @@ _MULTIHOP_PROMPT = (
 )
 
 
-def _rare_tokens(p: str) -> set[str]:
-    """段落的「稀有 token 候選」: 拉丁字 (≥4 字元) + CJK 連續片段的 2-gram。"""
-    toks = {t.lower() for t in re.findall(r"[A-Za-z][A-Za-z0-9\-]{3,}", p)}
-    for run in re.findall(r"[一-鿿]{2,}", p):
-        toks.update(run[i:i + 2] for i in range(len(run) - 1))
-    return toks
-
-
 def _related_pairs(paragraphs: list[str], rng: random.Random) -> list[tuple[int, int]]:
     """找「共享稀有 token」的段落對 (多跳題需要兩段有實體關聯，隨機配對會不自然)。
-    稀有 = 該 token 只出現在 2~3 個段落。依共享數排序，同分隨機。"""
+    稀有 = 該 token 只出現在 2~3 個段落。依共享數排序，同分隨機。
+    token 定義與 rag.py 的 graph-lite 檢索共用 (key_tokens)。"""
+    from rag import key_tokens
     tok_paras: dict[str, list[int]] = {}
     for i, p in enumerate(paragraphs):
-        for t in _rare_tokens(p):
+        for t in key_tokens(p):
             tok_paras.setdefault(t, []).append(i)
     pair_score: Counter = Counter()
     for t, idxs in tok_paras.items():

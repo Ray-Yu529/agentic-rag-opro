@@ -7,6 +7,12 @@ import pytest
 import rag
 from rag import ABSTAIN, RagConfig, is_abstain, make_chunks
 
+# 完整 10 維配置 dict (SEARCH_SPACE 全欄位)，供提案/快取鍵測試用
+FULL_CFG = {"chunk_size": 512, "top_k": 5, "retriever": "hybrid",
+            "chunk_overlap": 0, "hybrid_alpha": 0.5, "rerank": True,
+            "query_decompose": False, "hyde": False, "iterative": False,
+            "verify": False}
+
 
 # --- 棄答偵測 (雙語) ----------------------------------------------------------
 @pytest.mark.parametrize("ans", [
@@ -128,12 +134,11 @@ def test_chunkindex_subset_embedding(monkeypatch):
     assert embed_calls[-1] == (2, "passage")               # 全量只補缺的
 
 
-# --- rerank: dense backend 的等價跳過 + 快取鍵正規化 ------------------------------
+# --- 等價配置正規化 (快取鍵) --------------------------------------------------
 def test_rerank_dense_noop_key(monkeypatch):
     import cache as cachemod
     monkeypatch.setattr(cachemod, "RERANK_MODEL", "dense")
-    a = {"chunk_size": 512, "top_k": 5, "retriever": "dense", "chunk_overlap": 0,
-         "rerank": True, "query_decompose": False, "verify": False}
+    a = dict(FULL_CFG, retriever="dense")
     b = dict(a, rerank=False)
     assert cachemod.config_key(a) == cachemod.config_key(b)   # 等價 -> 同一筆快取
     c = dict(a, retriever="bm25")
@@ -141,6 +146,18 @@ def test_rerank_dense_noop_key(monkeypatch):
     # 預設 (真 reranker) 不做正規化
     monkeypatch.setattr(cachemod, "RERANK_MODEL", "some-reranker")
     assert cachemod.config_key(a) != cachemod.config_key(b)
+
+
+def test_alpha_canonical_key():
+    import cache as cachemod
+    # α 只影響 hybrid/graph；bm25/dense 下不同 α 是等價配置 -> 共用快取鍵
+    a = dict(FULL_CFG, retriever="bm25", hybrid_alpha=0.3, rerank=False)
+    b = dict(a, hybrid_alpha=0.7)
+    assert cachemod.config_key(a) == cachemod.config_key(b)
+    # hybrid 下 α 真的有差 -> 不正規化
+    h3 = dict(FULL_CFG, hybrid_alpha=0.3)
+    h7 = dict(FULL_CFG, hybrid_alpha=0.7)
+    assert cachemod.config_key(h3) != cachemod.config_key(h7)
 
 
 # --- racing 提早停止 --------------------------------------------------------------
@@ -189,17 +206,18 @@ def test_objective_and_proposals(tmp_path):
     assert objective(s, 0.5, 0.0) == pytest.approx(0.75)
     assert objective(s, 0.5, 0.1) == pytest.approx(0.55)   # μ×2ktok = 0.2
     assert DEFAULT_LAMBDA == 0.5
-    assert len(all_configs()) == 216
+    # 3 chunk × 3 top_k × 4 retriever × 2 overlap × 3 α × 2^5 開關 = 6912
+    assert len(all_configs()) == 6912
 
-    good = {"chunk_size": 512, "top_k": 5, "retriever": "hybrid",
-            "rerank": True, "query_decompose": False, "verify": False}
-    assert is_valid(good) and not is_valid(dict(good, chunk_size=999))
-    assert len(_valid_untried([good, dict(good), dict(good, chunk_size=999)],
-                              set())) == 1
+    assert is_valid(FULL_CFG)
+    assert not is_valid(dict(FULL_CFG, chunk_size=999))
+    assert not is_valid({k: v for k, v in FULL_CFG.items() if k != "hyde"})  # 缺欄位
+    assert len(_valid_untried([FULL_CFG, dict(FULL_CFG),
+                               dict(FULL_CFG, chunk_size=999)], set())) == 1
 
     from memory.trajectory import Trajectory, Trial
     traj = Trajectory(tmp_path / "t.jsonl")
-    traj.add(Trial(config={**good, "chunk_overlap": 0},
+    traj.add(Trial(config=dict(FULL_CFG),
                    score={"correctness": 0.8, "faithfulness": 1.0},
                    objective=0.8, lam=0.5))
     lines = _marginal_lines(traj)
@@ -264,10 +282,9 @@ def test_warmstart_roundtrip(tmp_path, monkeypatch):
                 "avg_para_chars": 120.0, "cjk_ratio": 0.9}
     feats_en = {"n_questions": 30, "n_paragraphs": 300,
                 "avg_para_chars": 600.0, "cjk_ratio": 0.0}
-    cfg_zh = {"chunk_size": 256, "top_k": 5, "retriever": "hybrid",
-              "rerank": True, "query_decompose": False, "verify": True}
-    cfg_en = {"chunk_size": 1024, "top_k": 8, "retriever": "dense",
-              "rerank": False, "query_decompose": True, "verify": False}
+    cfg_zh = dict(FULL_CFG, chunk_size=256, verify=True)
+    cfg_en = dict(FULL_CFG, chunk_size=1024, top_k=8, retriever="dense",
+                  rerank=False, query_decompose=True)
     ws.record("ds-zh", feats_zh, cfg_zh, 0.7)
     ws.record("ds-en", feats_en, cfg_en, 0.6)
     ws.record("ds-zh", feats_zh, dict(cfg_zh, top_k=3), 0.5)   # 較差 -> 不覆蓋
@@ -282,3 +299,93 @@ def test_warmstart_roundtrip(tmp_path, monkeypatch):
     assert n_warm == 1 and len(init) == 3     # 去重+非法過濾，隨機補滿
     init2, n0 = _warm_init(grid, None, 3)
     assert n0 == 0 and len(init2) == 3
+
+
+# --- graph-lite 檢索: 橋接 chunk 被實體共現邊拉上來 ---------------------------------
+def test_graph_pulls_bridge_chunk():
+    # A 與 query 高度相關 (種子)；B 與 A 共享稀有實體 zephyrium (橋接) 但與
+    # query 無字面重疊；C 無關。α=0 -> 純 bm25，不打任何 API。
+    chunks = [
+        "The zephyrium reactor was designed by Doctor Marlow in Geneva.",
+        "Zephyrium alloys are produced only at the Kestrel facility in Norway.",
+        "Bananas are rich in potassium and grow in tropical climates.",
+    ]
+    query = "Who designed the reactor built by Doctor Marlow?"
+    idx = rag.ChunkIndex(chunks)
+    base = idx.scores(query, "hybrid", alpha=0.0)
+    graph = idx.scores(query, "graph", alpha=0.0, seed_k=1)
+    assert graph[1] > base[1]                       # 橋接 chunk 被加分
+    assert list(np.argsort(graph)[::-1][:2]) == [0, 1]   # 種子+橋接進前二
+    assert np.argsort(graph)[::-1][2] == 2          # 無關 chunk 還是最後
+
+
+def test_hybrid_alpha_weighting(monkeypatch):
+    # fake embedding: 讓 dense 偏愛 chunk1 (與 query 向量同向)，bm25 偏愛 chunk0
+    def fake_embed(texts, input_type):
+        vecs = []
+        for t in texts:
+            if input_type == "query" or "quantum" in t:
+                vecs.append([0.0, 1.0])     # query 與 chunk1 同向
+            else:
+                vecs.append([1.0, 0.0])
+        return np.array(vecs, dtype=float), 10
+
+    calls = []
+    monkeypatch.setattr(rag, "_embed",
+                        lambda t, it: (calls.append(1), fake_embed(t, it))[1])
+    chunks = ["apple pie recipe with apples", "quantum entanglement basics"]
+    q = "apple pie"
+
+    idx = rag.ChunkIndex(chunks)
+    assert int(np.argmax(idx.scores(q, "hybrid", alpha=0.0))) == 0   # 純字面
+    assert not calls                     # α=0 短路，完全不碰 embedding
+    assert int(np.argmax(idx.scores(q, "hybrid", alpha=1.0))) == 1   # 純語意
+    assert calls                         # α=1 才需要 embedding
+
+
+# --- iterative + HyDE 管線 (全 mock，不打 API) --------------------------------------
+def test_run_rag_iterative_and_hyde(monkeypatch):
+    monkeypatch.setattr(rag, "generate", lambda q, ch: ("Paris", 5))
+    monkeypatch.setattr(rag, "hyde_query", lambda q: ("The capital city is Paris.", 3))
+    gap_calls = []
+
+    def fake_gap(q, ch):
+        gap_calls.append(len(ch))
+        return "second hop query about towers", 4
+
+    monkeypatch.setattr(rag, "gap_query", fake_gap)
+    paras = [f"passage number {i} about towers and capitals " * 3 for i in range(6)]
+    cfg = RagConfig(chunk_size=512, top_k=2, retriever="bm25",
+                    hyde=True, iterative=True)
+    res = rag.run_rag("What is the capital?", paras, cfg)
+    assert res.answer == "Paris"
+    assert gap_calls and gap_calls[0] == 2          # 第一輪 top_k=2 進 gap 檢查
+    assert len(res.retrieved_chunks) <= cfg.top_k + 3   # 合併上限
+    assert res.tokens >= 5 + 3 + 4                  # generate + hyde + gap
+
+    # gap 回 NONE -> 不做第二輪，檢索結果維持 top_k
+    monkeypatch.setattr(rag, "gap_query", lambda q, ch: (None, 2))
+    res2 = rag.run_rag("What is the capital?", paras, cfg)
+    assert len(res2.retrieved_chunks) == 2
+
+
+# --- 雙判官抽查一致率 ----------------------------------------------------------------
+def test_judge_audit_agreement(monkeypatch):
+    import eval as ev
+    import judge
+
+    monkeypatch.setattr(judge, "AUDIT_RATE", 1.0)   # 全抽
+    monkeypatch.setattr(ev, "run_rag", lambda q, p, c: rag.RagResult(
+        answer="Paris", retrieved_idx=[0], retrieved_chunks=["ctx"],
+        faithful=1.0, tokens=10, latency=0.0))
+    monkeypatch.setattr(judge, "judge_correctness", lambda *a: (1.0, 0))
+    monkeypatch.setattr(judge, "audit_correctness", lambda *a: (0.0, 0))  # 全不同意
+
+    score = ev.evaluate(RagConfig(), _fake_examples(4), verbose=False)
+    assert score.judge_agreement == 0.0
+    assert score.as_dict()["judge_agreement"] == 0.0
+
+    # 抽查關閉 -> None，不多花任何呼叫
+    monkeypatch.setattr(judge, "AUDIT_RATE", 0.0)
+    score2 = ev.evaluate(RagConfig(), _fake_examples(4), verbose=False)
+    assert score2.judge_agreement is None

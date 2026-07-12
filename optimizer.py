@@ -1,8 +1,9 @@
 """
 optimizer.py — 搜索空間 + 多目標 + random baseline (D3) + OPRO 迴路 (D4)
 
-搜索空間 (加了 3 個 agentic 開關後 = 216 組):
-  chunk_size × top_k × retriever × rerank × query_decompose × verify
+搜索空間 (6912 組):
+  chunk_size × top_k × retriever(含 graph) × chunk_overlap × hybrid_alpha
+  × rerank × query_decompose × hyde × iterative × verify
 全掃不可行 -> random / OPRO 都用 cache.evaluate_cached 即時評估 (查過不重跑)。
 
 多目標 objective: 最大化正確率、同時懲罰幻覺
@@ -54,13 +55,17 @@ def chat_json(prompt: str, temperature: float, max_tokens: int,
     except json.JSONDecodeError:
         return {}
 
-# --- 搜索空間 θ (216 組) ---------------------------------------------------
+# --- 搜索空間 θ (6912 組) ---------------------------------------------------
 SEARCH_SPACE = {
     "chunk_size": [256, 512, 1024],
     "top_k": [3, 5, 8],
-    "retriever": ["bm25", "dense", "hybrid"],
+    "retriever": ["bm25", "dense", "hybrid", "graph"],   # graph = graph-lite GraphRAG
+    "chunk_overlap": [0, 64],
+    "hybrid_alpha": [0.3, 0.5, 0.7],    # hybrid/graph 的 dense 權重 (其餘檢索器無效)
     "rerank": [False, True],
     "query_decompose": [False, True],
+    "hyde": [False, True],              # agentic: 假設答案當額外查詢
+    "iterative": [False, True],         # agentic: 缺口再檢索一輪
     "verify": [False, True],
 }
 
@@ -171,9 +176,11 @@ def _build_meta_prompt(traj: Trajectory, cache: ResultCache,
         c, s = t.config, t.score
         pruned = " [提早停止:確定劣於當時最佳]" if s.get("pruned") else ""
         lines.append(
-            f"  #{rank} chunk={c['chunk_size']}, top_k={c['top_k']}, ret={c['retriever']:6s}, "
-            f"rerank={int(c['rerank'])}, decomp={int(c['query_decompose'])}, "
-            f"verify={int(c['verify'])} "
+            f"  #{rank} chunk={c['chunk_size']}/ov{c.get('chunk_overlap', 0)}, "
+            f"top_k={c['top_k']}, ret={c['retriever']}, "
+            f"α={c.get('hybrid_alpha', 0.5)}, rerank={int(c['rerank'])}, "
+            f"hyde={int(c.get('hyde', 0))}, iter={int(c.get('iterative', 0))}, "
+            f"decomp={int(c['query_decompose'])}, verify={int(c['verify'])} "
             f"-> 正確率={s['correctness']:.2f}, 幻覺率={1-s['faithfulness']:.2f}, "
             f"棄答率={s.get('abstain_rate', 0):.2f}, "
             f"recall={s['recall']:.2f}, obj={t.objective:.3f}, "
@@ -204,9 +211,13 @@ def _build_meta_prompt(traj: Trajectory, cache: ResultCache,
 合法參數值 (提案必須從這裡選):
   chunk_size      ∈ {SEARCH_SPACE['chunk_size']}
   top_k           ∈ {SEARCH_SPACE['top_k']}
-  retriever       ∈ {SEARCH_SPACE['retriever']}
-  rerank          ∈ [false, true]   (檢索後重排)
-  query_decompose ∈ [false, true]   (多跳問題拆解，HotpotQA 是多跳)
+  retriever       ∈ {SEARCH_SPACE['retriever']}   (graph=實體共現圖擴展，撈多跳的橋接段落)
+  chunk_overlap   ∈ {SEARCH_SPACE['chunk_overlap']}
+  hybrid_alpha    ∈ {SEARCH_SPACE['hybrid_alpha']}  (hybrid/graph 的 dense 權重；bm25/dense 下無效請填 0.5)
+  rerank          ∈ [false, true]   (專用 reranker 重排候選)
+  query_decompose ∈ [false, true]   (多跳問題拆解)
+  hyde            ∈ [false, true]   (假設答案當額外查詢，dense 檢索受益)
+  iterative       ∈ [false, true]   (看第一輪缺什麼、再檢索一輪，打檢索瓶頸)
   verify          ∈ [false, true]   (NLI 自我檢查，降幻覺但增成本)
 
 已測配置 (依 objective 由高到低):
@@ -224,14 +235,17 @@ def _build_meta_prompt(traj: Trajectory, cache: ResultCache,
 
 請依步驟思考:
 1. 診斷: 從失敗分群看瓶頸在「檢索」還是「生成/幻覺」?
-   - 檢索瓶頸 (retrieval 多) -> 試 query_decompose / rerank / 調大 top_k / 換 retriever
-   - 生成瓶頸或幻覺高 -> 試 verify / 調整 chunk_size
+   - 檢索瓶頸 (retrieval 多) -> 試 iterative / hyde / query_decompose / rerank /
+     graph 檢索 / 調大 top_k / 調 hybrid_alpha
+   - 生成瓶頸或幻覺高 -> 試 verify / 調整 chunk_size 或 chunk_overlap
 2. 探索 vs 利用: 早期提差異大的組合; 後期在最佳配置附近微調。
 3. 提案最多 2 組「未測過」且最值得測的配置。
 
 只輸出 JSON，不要其他文字:
 {{"reasoning": "你的診斷與推論 (繁體中文，2-4 句)",
-  "proposals": [{{"chunk_size":512,"top_k":5,"retriever":"hybrid","rerank":true,"query_decompose":true,"verify":false}}]}}"""
+  "proposals": [{{"chunk_size":512,"top_k":5,"retriever":"hybrid","chunk_overlap":0,
+  "hybrid_alpha":0.5,"rerank":true,"query_decompose":true,"hyde":false,
+  "iterative":true,"verify":false}}]}}"""
 
 
 def _call_meta(prompt: str) -> dict:
@@ -244,7 +258,9 @@ def _call_meta(prompt: str) -> dict:
 def _config_from_proposal(d: dict) -> RagConfig:
     return RagConfig(
         chunk_size=d["chunk_size"], top_k=d["top_k"], retriever=d["retriever"],
+        chunk_overlap=d["chunk_overlap"], hybrid_alpha=d["hybrid_alpha"],
         rerank=bool(d["rerank"]), query_decompose=bool(d["query_decompose"]),
+        hyde=bool(d["hyde"]), iterative=bool(d["iterative"]),
         verify=bool(d["verify"]),
     )
 

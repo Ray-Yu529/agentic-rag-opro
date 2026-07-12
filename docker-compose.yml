@@ -1,0 +1,10 @@
+services:
+  app:
+    build: .
+    ports:
+      - "8000:8000"
+    env_file: .env          # NVIDIA_API_KEY (+ 選填的模型覆寫)
+    volumes:
+      - ./data:/app/data          # 自訂語料 / 生成 QA / warm-start / 評估快取
+      - ./results:/app/results    # 軌跡 / 歷史 / 圖表
+    restart: unless-stopped

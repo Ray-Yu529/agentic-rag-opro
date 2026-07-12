@@ -15,6 +15,7 @@ eval.py — HotpotQA 子集載入 + 評估指標 (Demo 版)
 
 from __future__ import annotations
 
+import hashlib
 import re
 import string
 import random
@@ -187,6 +188,7 @@ class EvalScore:
     avg_tokens: float          # 成本: 每題平均 token
     n: int                     # 實際成功評估的題數 (分母)
     n_errors: int = 0          # API 失敗被跳過的題數 (過多會整輪作廢，見 evaluate)
+    judge_agreement: float | None = None   # 主/稽核判官一致率 (抽查關閉時 None)
     details: list[QuestionDetail] = None
 
     def as_dict(self) -> dict:
@@ -194,7 +196,8 @@ class EvalScore:
                 "faithfulness": self.faithfulness, "correctness": self.correctness,
                 "abstain_rate": self.abstain_rate,
                 "avg_latency": self.avg_latency, "avg_tokens": self.avg_tokens,
-                "n": self.n, "n_errors": self.n_errors}
+                "n": self.n, "n_errors": self.n_errors,
+                "judge_agreement": self.judge_agreement}
 
     def hallucination_rate(self) -> float:
         return 1.0 - self.faithfulness
@@ -227,6 +230,15 @@ def _classify(recall: float, correct: float, abstained: bool) -> str:
     return "generation"
 
 
+def _audit_pick(question: str) -> bool:
+    """雙判官抽查的確定性抽樣: 同一題在所有配置下都被抽 (跨配置可比)。"""
+    from judge import AUDIT_RATE
+    if AUDIT_RATE <= 0:
+        return False
+    h = int(hashlib.sha1(question.encode("utf-8")).hexdigest()[:8], 16)
+    return h / 0xFFFFFFFF < AUDIT_RATE
+
+
 def _partial_score(em_s, f1_s, rec_s, faith_s, corr_s, abst_s, lat_s, tok_s,
                    n_ok: int, errors: int) -> dict:
     """racing 提早停止時的部分平均 (供軌跡顯示，欄位對齊 EvalScore.as_dict)。"""
@@ -244,9 +256,10 @@ def evaluate(cfg: RagConfig, examples: list[Example], verbose: bool = True,
     評到一半若「剩餘題全對且零幻覺」的樂觀上界仍低於 prune_below，
     拋 EvalPruned 提早停止，省下注定追不上的評估成本。"""
     # 局部 import 避免模組載入順序問題
-    from judge import judge_correctness, judge_faithfulness
+    from judge import audit_correctness, judge_correctness, judge_faithfulness
 
     em_s = f1_s = rec_s = faith_s = corr_s = abst_s = lat_s = tok_s = 0.0
+    agree_s, audit_n = 0.0, 0
     errors = 0
     details: list[QuestionDetail] = []
     iterator = tqdm(examples, desc=str(cfg.key()), disable=not verbose)
@@ -269,6 +282,11 @@ def evaluate(cfg: RagConfig, examples: list[Example], verbose: bool = True,
                 else:
                     faithful, _ = judge_faithfulness(res.answer, res.retrieved_chunks)
                 correct, _ = judge_correctness(ex.question, res.answer, ex.answer)
+                # 雙判官交叉驗證 (JUDGE_AUDIT_RATE>0 才啟用): 抽查一致率
+                if _audit_pick(ex.question):
+                    correct2, _ = audit_correctness(ex.question, res.answer, ex.answer)
+                    agree_s += float(correct2 == correct)
+                    audit_n += 1
         except Exception as e:  # noqa: BLE001  — 單題偶發失敗不中斷，但過多會整輪作廢
             errors += 1
             if verbose:
@@ -316,7 +334,9 @@ def evaluate(cfg: RagConfig, examples: list[Example], verbose: bool = True,
                      faithfulness=faith_s / n_ok, correctness=corr_s / n_ok,
                      abstain_rate=abst_s / n_ok,
                      avg_latency=lat_s / n_ok, avg_tokens=tok_s / n_ok,
-                     n=n_ok, n_errors=errors, details=details)
+                     n=n_ok, n_errors=errors,
+                     judge_agreement=(agree_s / audit_n if audit_n else None),
+                     details=details)
 
 
 if __name__ == "__main__":
@@ -333,4 +353,6 @@ if __name__ == "__main__":
     print(f"  correctness  = {score.correctness:.3f} (LLM judge)")
     print(f"  faithfulness = {score.faithfulness:.3f} (幻覺率 {score.hallucination_rate():.3f})")
     print(f"  abstain rate = {score.abstain_rate:.3f} (守門員棄答比例)")
+    if score.judge_agreement is not None:
+        print(f"  judge agree  = {score.judge_agreement:.3f} (雙判官一致率；<0.8 該換判官)")
     print(f"  cost         = {score.avg_latency:.2f}s, {score.avg_tokens:.0f} tok/題")

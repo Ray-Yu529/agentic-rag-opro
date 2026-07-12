@@ -15,6 +15,7 @@ hybrid.py — 混合最佳化: LLM 縮範圍 -> Optuna 在範圍內收斂
 
 from __future__ import annotations
 
+import json
 import random
 
 from rag import RagConfig
@@ -26,23 +27,24 @@ from optimizer import (DEFAULT_LAMBDA, DEFAULT_MU, SEARCH_SPACE, all_configs,
 
 
 def _ask_region(traj: Trajectory) -> dict:
-    """請 LLM 把每個維度限縮成子集。回傳 {dim: [values...]}，缺/錯的維度退回全集。"""
+    """請 LLM 把每個維度限縮成子集。回傳 {dim: [values...]}，缺/錯的維度退回全集。
+    維度清單/JSON 範例從 SEARCH_SPACE 動態生成，之後加維度不會漏。"""
     ranked = sorted(traj.trials, key=lambda t: t.objective, reverse=True)
     lines = [
-        f"  obj={t.objective:.3f}: chunk={t.config['chunk_size']}, top_k={t.config['top_k']}, "
-        f"ret={t.config['retriever']}, rerank={int(t.config['rerank'])}, "
-        f"decomp={int(t.config['query_decompose'])}, verify={int(t.config['verify'])}"
+        f"  obj={t.objective:.3f}: "
+        + ", ".join(f"{k}={t.config.get(k)}" for k in SEARCH_SPACE)
         for t in ranked
     ]
+    dims = "\n".join(f"  {k} ∈ {v}" for k, v in SEARCH_SPACE.items())
+    example = json.dumps({k: [] for k in SEARCH_SPACE}, ensure_ascii=False)
     prompt = f"""你是 RAG 最佳化架構師。以下是目前的實驗結果 (objective 越高越好):
 {chr(10).join(lines)}
 
 合法值:
-  chunk_size ∈ {SEARCH_SPACE['chunk_size']}, top_k ∈ {SEARCH_SPACE['top_k']},
-  retriever ∈ {SEARCH_SPACE['retriever']}, rerank/query_decompose/verify ∈ [false,true]
+{dims}
 
 請判斷哪些值得繼續搜，把每個維度限縮成「值得搜的子集」(可只留 1~2 個值)，砍掉看起來沒用的。
-只輸出 JSON: {{"reasoning":"...", "region":{{"chunk_size":[...],"top_k":[...],"retriever":[...],"rerank":[...],"query_decompose":[...],"verify":[...]}}}}"""
+只輸出 JSON: {{"reasoning":"...", "region":{example}}} (region 每個維度填入保留的值)"""
 
     region = chat_json(prompt, temperature=0.3, max_tokens=600).get("region", {})
     # 清洗: 子集必須 ⊆ 合法值，否則該維度退回全集
