@@ -77,7 +77,10 @@ def get_client() -> OpenAI:
         raise RuntimeError(
             "找不到 NVIDIA_API_KEY。請複製 .env.example 成 .env 並填入金鑰。"
         )
-    return OpenAI(base_url=NVIDIA_BASE_URL, api_key=api_key)
+    # openai client 預設逾時 600s；搭配 api_call 的 5 次重試，一個真正掛掉/
+    # 不回應的端點最壞情況要等將近 1 小時才報錯。降到 30s，讓我們自己的
+    # 指數退避負責重試節奏，而不是卡在單次請求裡。
+    return OpenAI(base_url=NVIDIA_BASE_URL, api_key=api_key, timeout=30.0)
 
 
 # NVIDIA 免費 tier 常回 429，暫時性錯誤一律指數退避重試
@@ -401,6 +404,12 @@ def _rerank_api(query: str, passages: list[str]) -> list[float] | None:
     for attempt in range(4):
         try:
             r = requests.post(RERANK_URL, headers=headers, json=body, timeout=60)
+            if r.status_code in (404, 410):
+                # 永久性錯誤 (端點/模型不存在或已除役) -> 立刻停損，不浪費重試
+                print(f"[warn] reranker 端點 HTTP {r.status_code} (永久性)，"
+                     "本進程退回 dense rerank")
+                _rerank_disabled = True
+                return None
             if r.status_code in (429, 500, 502, 503, 504):
                 time.sleep(2.0 * (2 ** attempt))
                 continue

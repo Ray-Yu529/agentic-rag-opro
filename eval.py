@@ -78,22 +78,36 @@ def _build_example(row: dict) -> Example:
 
 def load_hotpot(n: int = 30, n_hard: int = 15, seed: int = 42) -> list[Example]:
     """
-    從 HotpotQA distractor validation 抽 n 題，分層: n_hard 題 hard + 其餘 easy/medium。
-    這樣測試集才對「參數變化」有區分度 (純隨機會抽到一堆太簡單的題)。
+    分層: n_hard 題 hard + 其餘 easy/medium，測試集才對「參數變化」有區分度
+    (純隨機會抽到一堆太簡單的題)。
+
+    重要: HotpotQA distractor 的 **validation split 全部是 hard 難度**
+    (官方 dev-distractor 集就是這樣切的，7405 題清一色 hard；easy/medium
+    只存在於 train split)。所以 hard 題從 validation 抽，easy/medium 題
+    改從 train 抽 —— 兩個 split 本來就不相交，不會重複。
+    (若只從 validation 抽，n_hard 之外的名額會抽不到東西，回傳題數會
+    悄悄小於 n，這是先前從未實跑過才沒被抓到的 bug。)
     """
     # 明確用 hotpotqa/hotpot_qa (Hub 上已是 parquet 格式)，
     # datasets 3.x+ 移除 script 載入後仍可正常使用
-    ds = load_dataset("hotpotqa/hotpot_qa", "distractor", split="validation")
+    val_ds = load_dataset("hotpotqa/hotpot_qa", "distractor", split="validation")
     rng = random.Random(seed)
 
-    hard_idx = [i for i, lv in enumerate(ds["level"]) if lv == "hard"]
-    other_idx = [i for i, lv in enumerate(ds["level"]) if lv != "hard"]
+    hard_idx = list(range(len(val_ds)))
     rng.shuffle(hard_idx)
-    rng.shuffle(other_idx)
+    hard_rows = [val_ds[i] for i in hard_idx[:n_hard]]
 
-    picked = hard_idx[:n_hard] + other_idx[: max(0, n - n_hard)]
-    rng.shuffle(picked)
-    return [_build_example(ds[i]) for i in picked]
+    n_other = max(0, n - n_hard)
+    other_rows = []
+    if n_other:
+        train_ds = load_dataset("hotpotqa/hotpot_qa", "distractor", split="train")
+        other_idx = [i for i, lv in enumerate(train_ds["level"]) if lv != "hard"]
+        rng.shuffle(other_idx)
+        other_rows = [train_ds[i] for i in other_idx[:n_other]]
+
+    rows = hard_rows + other_rows
+    rng.shuffle(rows)
+    return [_build_example(r) for r in rows]
 
 
 # --- SQuAD 風格 EM / F1 (含 CJK 支援) ---------------------------------------
