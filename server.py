@@ -31,11 +31,14 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from eval import load_hotpot
-from cache import DEFAULT_DATASET, ResultCache, dataset_key, custom_dataset_key
+from rag import is_abstain, run_rag, strip_citations
+from cache import (DEFAULT_DATASET, ResultCache, dataset_key,
+                   custom_dataset_key, dict_to_config)
 from dataset import (split_paragraphs, generate_qa, validate_qa, save_qa,
                      load_qa, build_examples, dataset_fingerprint,
                      extract_pdf_text, MAX_PARAGRAPHS)
-from optimizer import DEFAULT_LAMBDA, DEFAULT_MU, random_search, opro_search
+from optimizer import (DEFAULT_LAMBDA, DEFAULT_MU, SEARCH_SPACE,
+                       bandit_search, random_search, opro_search)
 from hybrid import hybrid_search
 from memory import warmstart
 from memory.trajectory import Trajectory
@@ -65,7 +68,7 @@ def _load_examples(n: int, n_hard: int) -> list:
 
 
 class RunReq(BaseModel):
-    strategy: str = "opro"      # random | opro | hybrid
+    strategy: str = "opro"      # random | bandit | opro | hybrid
     n: int = 20                 # 測試題數 (custom 模式 = 生成/取用的 QA 題數)
     n_hard: int = 10            # hotpot 專用; custom 模式忽略
     budget: int = 8             # 評估次數
@@ -155,6 +158,8 @@ def _job(req: RunReq) -> None:
                       lam=req.lam, mu=req.mu)
         if req.strategy == "random":
             traj = random_search(**common)
+        elif req.strategy == "bandit":
+            traj = bandit_search(n_init=3, **common)
         elif req.strategy == "hybrid":
             traj = hybrid_search(n_init=3, warm_configs=warm, **common)
         else:
@@ -233,7 +238,7 @@ def status():
 @app.get("/api/results")
 def results():
     strategies, overall_best = {}, None
-    for name in ("random", "opro", "hybrid"):
+    for name in ("random", "bandit", "opro", "hybrid"):
         p = RESULTS / f"{name}.jsonl"
         if not p.exists():
             continue
@@ -271,6 +276,50 @@ def results():
             "lam": lam, "mu": mu}
 
 
+class AskReq(BaseModel):
+    question: str
+    config: dict | None = None      # None -> 用預設配置
+    corpus_text: str = ""           # Playground 的檢索語料
+
+
+@app.post("/api/ask")
+def ask(req: AskReq):
+    """Playground: 用指定配置對使用者語料即時問答。
+    回傳答案 (含 [n] 引用)、檢索到的段落、NLI 忠實度判定。"""
+    if not req.question.strip():
+        return {"ok": False, "msg": "問題是空的"}
+    paragraphs = split_paragraphs(req.corpus_text)
+    if not paragraphs:
+        return {"ok": False, "msg": "Playground 需要語料: 請在左側「自己的文件」提供內容"}
+    cfg = dict_to_config(req.config or {})
+    try:
+        res = run_rag(req.question, paragraphs, cfg, cite=True)
+        faithful = res.faithful
+        if faithful is None:   # verify 沒開也要給忠實度判定 (Playground 的賣點)
+            from judge import judge_faithfulness
+            faithful, _ = judge_faithfulness(strip_citations(res.answer),
+                                             res.retrieved_chunks)
+        return {"ok": True, "answer": res.answer, "citations": res.citations,
+                "chunks": res.retrieved_chunks, "faithful": faithful,
+                "abstained": res.abstained or is_abstain(res.answer),
+                "tokens": res.tokens, "latency": round(res.latency, 2)}
+    except Exception as e:  # noqa: BLE001 — 回報給前端而非 500
+        return {"ok": False, "msg": f"{type(e).__name__}: {e}"}
+
+
+@app.get("/api/records")
+def records():
+    """A/B 對比用: 目前測試集所有已評估配置的完整 record (含逐題對錯)。"""
+    with _lock:
+        dataset = STATE["dataset"]
+    cache = ResultCache(dataset=dataset)
+    return {"records": [
+        {"config": r["config"], "score": r["score"],
+         "per_question_correct": r.get("per_question_correct", {}),
+         "failures": r.get("failures", [])}
+        for r in cache.all_records()]}
+
+
 def _history_rows() -> list[dict]:
     if not HISTORY.exists():
         return []
@@ -289,6 +338,26 @@ def history():
 
 def _esc(v) -> str:
     return html.escape(str(v))
+
+
+def _sensitivity(trials: list[dict]) -> list[tuple[str, object, object, float]]:
+    """參數敏感度: 各維度「最佳取值均分 − 最差取值均分」的邊際效應差，遞減排序。
+    只看已試樣本、未控制交互作用 —— 是啟發式排序，不是因果結論。"""
+    stats: dict[tuple, tuple[int, float]] = {}
+    for t in trials:
+        for dim in SEARCH_SPACE:
+            key = (dim, t["config"].get(dim))
+            n, m = stats.get(key, (0, 0.0))
+            stats[key] = (n + 1, m + (t["objective"] - m) / (n + 1))
+    rows = []
+    for dim in SEARCH_SPACE:
+        vals = {v: m for (d, v), (_, m) in stats.items() if d == dim}
+        if len(vals) >= 2:
+            best_v = max(vals, key=vals.get)
+            worst_v = min(vals, key=vals.get)
+            rows.append((dim, best_v, worst_v, vals[best_v] - vals[worst_v]))
+    rows.sort(key=lambda r: -r[3])
+    return rows
 
 
 @app.get("/api/report/{run_id}", response_class=HTMLResponse)
@@ -313,6 +382,16 @@ def report(run_id: str):
             t["score"].get("correctness", 0), 1 - t["score"].get("faithfulness", 1),
             t["objective"])
         for t in sorted(row["trials"], key=lambda t: -t["objective"]))
+    sens_rows = "".join(
+        f"<tr><td>{_esc(dim)}</td><td>{_esc(bv)}</td><td>{_esc(wv)}</td>"
+        f"<td><b>{delta:+.3f}</b></td></tr>"
+        for dim, bv, wv, delta in _sensitivity(row["trials"]))
+    by_hop = row["best"]["score"].get("by_hop")
+    hop_html = ""
+    if by_hop:
+        hop_html = "<p>難度分層正確率: " + "、".join(
+            f"{'單跳' if h == '1' else '多跳'} {v:.0%}"
+            for h, v in by_hop.items()) + "</p>"
     log_html = "<br>".join(_esc(ln) for ln in row["log"])
 
     return HTMLResponse(f"""<!doctype html><html lang="zh-Hant"><head>
@@ -331,7 +410,12 @@ def report(run_id: str):
 <h2>參數</h2><table>{param_rows}</table>
 <h2>勝出配置 (objective={b['objective']:.3f}，正確率 {b['score'].get('correctness', 0):.0%}，
 幻覺率 {1 - b['score'].get('faithfulness', 1):.0%})</h2>
+{hop_html}
 <table>{cfg_rows}</table>
+<h2>參數敏感度 (邊際效應，最佳取值均分 − 最差取值均分)</h2>
+<p style="color:#666;font-size:.85rem">只看已試樣本、未控制交互作用，為啟發式排序。</p>
+<table><tr><th>維度</th><th>最佳取值</th><th>最差取值</th><th>Δ objective</th></tr>
+{sens_rows}</table>
 <h2>全部試驗 (依 objective)</h2>
 <table><tr><th>來源</th><th>配置</th><th>正確率</th><th>幻覺率</th><th>obj</th></tr>
 {trial_rows}</table>

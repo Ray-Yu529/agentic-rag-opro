@@ -3,8 +3,9 @@ import { useState } from "react";
 
 const STRATEGIES = [
   { id: "opro", label: "OPRO（LLM 推理提案）" },
-  { id: "random", label: "Random（baseline）" },
   { id: "hybrid", label: "Hybrid（LLM 縮範圍 + Optuna）" },
+  { id: "bandit", label: "Bandit（UCB，零 LLM）" },
+  { id: "random", label: "Random（baseline）" },
 ];
 
 export default function ConfigForm({ params, setParams, onRun, running }) {

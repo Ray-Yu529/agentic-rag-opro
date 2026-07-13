@@ -16,6 +16,7 @@ optimizer.py — 搜索空間 + 多目標 + random baseline (D3) + OPRO 迴路 (
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import random
@@ -55,7 +56,7 @@ def chat_json(prompt: str, temperature: float, max_tokens: int,
     except json.JSONDecodeError:
         return {}
 
-# --- 搜索空間 θ (6912 組) ---------------------------------------------------
+# --- 搜索空間 θ (27648 組) ---------------------------------------------------
 SEARCH_SPACE = {
     "chunk_size": [256, 512, 1024],
     "top_k": [3, 5, 8],
@@ -66,6 +67,8 @@ SEARCH_SPACE = {
     "query_decompose": [False, True],
     "hyde": [False, True],              # agentic: 假設答案當額外查詢
     "iterative": [False, True],         # agentic: 缺口再檢索一輪
+    "compress": [False, True],          # agentic: 檢索後壓縮 (省 token、升信噪比)
+    "parent_child": [False, True],      # 小 chunk 檢索、完整父段落餵生成器
     "verify": [False, True],
 }
 
@@ -152,6 +155,68 @@ def random_search(examples, cache: ResultCache, budget: int, seed: int,
     return traj
 
 
+# --- Bandit (UCB) baseline ---------------------------------------------------
+def _dim_stats(trials) -> dict[tuple, tuple[int, float]]:
+    """(維度, 取值) -> (試過次數, 平均 objective)。與 OPRO 的邊際統計同源。"""
+    stats: dict[tuple, tuple[int, float]] = {}
+    for t in trials:
+        for dim in SEARCH_SPACE:
+            key = (dim, t.config.get(dim))
+            n, m = stats.get(key, (0, 0.0))
+            stats[key] = (n + 1, m + (t.objective - m) / (n + 1))
+    return stats
+
+
+def _ucb_value(cfg: RagConfig, stats: dict, n_total: int,
+               c: float = 0.3, optimism: float = 1.0) -> float:
+    """維度可加性假設下的 UCB: 每維取值的平均 objective + 探索加成，
+    未試過的取值給樂觀初始值 (強迫探索)。刻意忽略維度間交互作用 ——
+    這正是它與 OPRO 對比的意義: 純統計、零 LLM 呼叫的中間 baseline。"""
+    total = 0.0
+    for dim in SEARCH_SPACE:
+        n, m = stats.get((dim, getattr(cfg, dim)), (0, 0.0))
+        total += optimism if n == 0 else m + c * math.sqrt(
+            math.log(max(2, n_total)) / n)
+    return total / len(SEARCH_SPACE)
+
+
+def bandit_search(examples, cache: ResultCache, budget: int, seed: int,
+                  traj_path: str, n_init: int = 3, verbose: bool = True,
+                  log_fn=None, lam: float = DEFAULT_LAMBDA,
+                  mu: float = DEFAULT_MU) -> Trajectory:
+    """第四策略: UCB bandit。「比 random 聰明、但零 LLM 呼叫」的中間 baseline，
+    讓「OPRO 的推理值不值那些 meta 呼叫」的對比更完整。"""
+    say = _make_say(log_fn, verbose)
+    rng = random.Random(seed)
+    grid = all_configs()
+    rng.shuffle(grid)   # UCB 同分時的 tie-break 隨機化
+
+    traj = Trajectory(traj_path)
+    traj.reset()
+    # 暖身: 與其他策略同 seed (公平起跑)
+    for cfg in grid[:n_init]:
+        rec = cache.evaluate_cached(cfg, examples, verbose=verbose,
+                                    prune_below=_incumbent(traj), prune_lam=lam)
+        traj.add(_trial(rec, source="init", lam=lam, mu=mu))
+        say(f"[暖身] {config_to_dict(cfg)} -> "
+            f"obj={objective(rec['score'], lam, mu):.3f}{_race_note(rec)}")
+
+    while len(traj.trials) < budget:
+        tried = traj.tried_keys()
+        stats = _dim_stats(traj.trials)
+        n_total = len(traj.trials)
+        cfg = max((c_ for c_ in grid if c_.key() not in tried),
+                  key=lambda c_: _ucb_value(c_, stats, n_total), default=None)
+        if cfg is None:
+            break
+        rec = cache.evaluate_cached(cfg, examples, verbose=verbose,
+                                    prune_below=_incumbent(traj), prune_lam=lam)
+        traj.add(_trial(rec, source="bandit", lam=lam, mu=mu))
+        say(f"[bandit] {config_to_dict(cfg)} -> "
+            f"obj={objective(rec['score'], lam, mu):.3f}{_race_note(rec)}")
+    return traj
+
+
 # --- D4: OPRO meta-optimizer -----------------------------------------------
 def _marginal_lines(traj: Trajectory) -> str:
     """每個參數取值的平均 objective (已試樣本內的邊際統計)，
@@ -180,7 +245,8 @@ def _build_meta_prompt(traj: Trajectory, cache: ResultCache,
             f"top_k={c['top_k']}, ret={c['retriever']}, "
             f"α={c.get('hybrid_alpha', 0.5)}, rerank={int(c['rerank'])}, "
             f"hyde={int(c.get('hyde', 0))}, iter={int(c.get('iterative', 0))}, "
-            f"decomp={int(c['query_decompose'])}, verify={int(c['verify'])} "
+            f"decomp={int(c['query_decompose'])}, cmp={int(c.get('compress', 0))}, "
+            f"pc={int(c.get('parent_child', 0))}, verify={int(c['verify'])} "
             f"-> 正確率={s['correctness']:.2f}, 幻覺率={1-s['faithfulness']:.2f}, "
             f"棄答率={s.get('abstain_rate', 0):.2f}, "
             f"recall={s['recall']:.2f}, obj={t.objective:.3f}, "
@@ -218,6 +284,8 @@ def _build_meta_prompt(traj: Trajectory, cache: ResultCache,
   query_decompose ∈ [false, true]   (多跳問題拆解)
   hyde            ∈ [false, true]   (假設答案當額外查詢，dense 檢索受益)
   iterative       ∈ [false, true]   (看第一輪缺什麼、再檢索一輪，打檢索瓶頸)
+  compress        ∈ [false, true]   (檢索後壓縮成相關句子，省 token、升信噪比)
+  parent_child    ∈ [false, true]   (小 chunk 檢索命中、完整父段落餵生成器)
   verify          ∈ [false, true]   (NLI 自我檢查，降幻覺但增成本)
 
 已測配置 (依 objective 由高到低):
@@ -228,6 +296,8 @@ def _build_meta_prompt(traj: Trajectory, cache: ResultCache,
 
 目前最佳配置的失敗分群: {clusters}
 (retrieval=檢索沒撈全, generation=撈到卻答錯, abstain=守門員/生成器棄答)
+最佳配置的難度分層正確率 (1=單跳, 2=多跳): {ranked[0].score.get('by_hop') or '(單一難度層)'}
+(多跳明顯較差 -> graph / query_decompose / iterative 是對症的開關)
 代表失敗題:
 {fails}
 
@@ -238,14 +308,15 @@ def _build_meta_prompt(traj: Trajectory, cache: ResultCache,
    - 檢索瓶頸 (retrieval 多) -> 試 iterative / hyde / query_decompose / rerank /
      graph 檢索 / 調大 top_k / 調 hybrid_alpha
    - 生成瓶頸或幻覺高 -> 試 verify / 調整 chunk_size 或 chunk_overlap
-2. 探索 vs 利用: 早期提差異大的組合; 後期在最佳配置附近微調。
-3. 提案最多 2 組「未測過」且最值得測的配置。
+2. 成本高 (tokens 多) 而 μ>0 時 -> 試 compress / 調小 top_k。
+3. 探索 vs 利用: 早期提差異大的組合; 後期在最佳配置附近微調。
+4. 提案最多 2 組「未測過」且最值得測的配置。
 
 只輸出 JSON，不要其他文字:
 {{"reasoning": "你的診斷與推論 (繁體中文，2-4 句)",
   "proposals": [{{"chunk_size":512,"top_k":5,"retriever":"hybrid","chunk_overlap":0,
   "hybrid_alpha":0.5,"rerank":true,"query_decompose":true,"hyde":false,
-  "iterative":true,"verify":false}}]}}"""
+  "iterative":true,"compress":false,"parent_child":false,"verify":false}}]}}"""
 
 
 def _call_meta(prompt: str) -> dict:
@@ -261,6 +332,7 @@ def _config_from_proposal(d: dict) -> RagConfig:
         chunk_overlap=d["chunk_overlap"], hybrid_alpha=d["hybrid_alpha"],
         rerank=bool(d["rerank"]), query_decompose=bool(d["query_decompose"]),
         hyde=bool(d["hyde"]), iterative=bool(d["iterative"]),
+        compress=bool(d["compress"]), parent_child=bool(d["parent_child"]),
         verify=bool(d["verify"]),
     )
 

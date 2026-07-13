@@ -7,11 +7,11 @@ import pytest
 import rag
 from rag import ABSTAIN, RagConfig, is_abstain, make_chunks
 
-# 完整 10 維配置 dict (SEARCH_SPACE 全欄位)，供提案/快取鍵測試用
+# 完整 12 維配置 dict (SEARCH_SPACE 全欄位)，供提案/快取鍵測試用
 FULL_CFG = {"chunk_size": 512, "top_k": 5, "retriever": "hybrid",
             "chunk_overlap": 0, "hybrid_alpha": 0.5, "rerank": True,
             "query_decompose": False, "hyde": False, "iterative": False,
-            "verify": False}
+            "compress": False, "parent_child": False, "verify": False}
 
 
 # --- 棄答偵測 (雙語) ----------------------------------------------------------
@@ -206,8 +206,8 @@ def test_objective_and_proposals(tmp_path):
     assert objective(s, 0.5, 0.0) == pytest.approx(0.75)
     assert objective(s, 0.5, 0.1) == pytest.approx(0.55)   # μ×2ktok = 0.2
     assert DEFAULT_LAMBDA == 0.5
-    # 3 chunk × 3 top_k × 4 retriever × 2 overlap × 3 α × 2^5 開關 = 6912
-    assert len(all_configs()) == 6912
+    # 3 chunk × 3 top_k × 4 retriever × 2 overlap × 3 α × 2^7 開關 = 27648
+    assert len(all_configs()) == 27648
 
     assert is_valid(FULL_CFG)
     assert not is_valid(dict(FULL_CFG, chunk_size=999))
@@ -244,7 +244,7 @@ def test_cache_record_and_pruned(tmp_path, monkeypatch):
 
     d = QuestionDetail(question="q1", gold="g", pred=ABSTAIN, em=0, f1=0,
                        recall=1.0, faithful=1.0, correct=0.0,
-                       fail_type="abstain", retrieved_preview="")
+                       fail_type="abstain", hop=1, retrieved_preview="")
     es = EvalScore(em=0, f1=0, recall=1, faithfulness=1, correctness=0,
                    abstain_rate=1, avg_latency=0, avg_tokens=0, n=1,
                    n_errors=0, details=[d])
@@ -389,3 +389,109 @@ def test_judge_audit_agreement(monkeypatch):
     monkeypatch.setattr(judge, "AUDIT_RATE", 0.0)
     score2 = ev.evaluate(RagConfig(), _fake_examples(4), verbose=False)
     assert score2.judge_agreement is None
+
+
+# --- parent_child: 小 chunk 檢索、完整父段落餵入 -------------------------------------
+def test_parent_child_context(monkeypatch):
+    captured = {}
+
+    def fake_generate(q, ctx):
+        captured["ctx"] = ctx
+        return "Paris", 5
+
+    monkeypatch.setattr(rag, "generate", fake_generate)
+    # 每段 ~600 字元 -> chunk_size=256 會切成多個小 chunk
+    paras = [f"paragraph {i} " + f"tower capital {i} " * 40 for i in range(3)]
+    cfg = RagConfig(chunk_size=256, top_k=4, retriever="bm25", parent_child=True)
+    res = rag.run_rag("tower capital", paras, cfg)
+    # 餵生成器/回傳的是「完整父段落」(去重)，不是小 chunk
+    stripped = [p.strip() for p in paras]
+    assert all(c in stripped for c in res.retrieved_chunks)
+    assert len(res.retrieved_chunks) == len(set(res.retrieved_chunks))
+    assert captured["ctx"] == res.retrieved_chunks
+
+    # 關掉 parent_child -> 回傳的是小 chunk (長度 <= chunk_size)
+    res2 = rag.run_rag("tower capital", paras,
+                       RagConfig(chunk_size=256, top_k=4, retriever="bm25"))
+    assert all(len(c) <= 256 for c in res2.retrieved_chunks)
+
+
+# --- compress: 生成器吃壓縮後 context，recall 仍用原 chunk ---------------------------
+def test_compress_context(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(rag, "generate",
+                        lambda q, ctx: (captured.setdefault("ctx", ctx), ("Paris", 5))[1])
+    monkeypatch.setattr(rag, "compress_chunks", lambda q, ch: (["COMPRESSED"], 7))
+    paras = [f"passage {i} about towers " * 5 for i in range(4)]
+    cfg = RagConfig(chunk_size=512, top_k=2, retriever="bm25", compress=True)
+    res = rag.run_rag("towers?", paras, cfg)
+    assert captured["ctx"] == ["COMPRESSED"]          # 生成器吃壓縮版
+    assert res.retrieved_chunks != ["COMPRESSED"]     # recall/忠實度仍用原 chunk
+    assert res.tokens >= 5 + 7
+
+
+# --- citations 解析 -------------------------------------------------------------------
+class _FakeChatResp:
+    def __init__(self, content):
+        self.choices = [type("C", (), {"message": type("M", (), {"content": content})()})()]
+        self.usage = type("U", (), {"total_tokens": 12})()
+
+
+def test_generate_cited_and_strip(monkeypatch):
+    monkeypatch.setattr(rag, "get_client", lambda: type("X", (), {
+        "chat": type("Ch", (), {"completions": type("Co", (), {
+            "create": staticmethod(lambda **kw: None)})()})()})())
+    monkeypatch.setattr(rag, "api_call",
+                        lambda fn, *a, **kw: _FakeChatResp("Paris [2] [9] [1]"))
+    ans, cites, tok = rag.generate_cited("q", ["a", "b", "c"])
+    assert cites == [1, 2]            # [9] 超出範圍被丟棄
+    assert tok == 12
+    assert rag.strip_citations(ans) == "Paris"
+
+
+# --- hop 難度分層 ---------------------------------------------------------------------
+def test_hop_stratified(monkeypatch):
+    import eval as ev
+    import judge
+    from eval import Example
+
+    monkeypatch.setattr(judge, "AUDIT_RATE", 0.0)
+    monkeypatch.setattr(ev, "run_rag", lambda q, p, c: rag.RagResult(
+        answer="Paris", retrieved_idx=[0], retrieved_chunks=["ctx"],
+        faithful=1.0, tokens=1, latency=0.0))
+    # 多跳題全對、單跳題全錯 -> by_hop 分層看得到差異
+    monkeypatch.setattr(judge, "judge_correctness",
+                        lambda q, pred, gold: (1.0 if q.startswith("mh") else 0.0, 0))
+    examples = (
+        [Example(question=f"sh{i}", answer="g", paragraphs=["ctx"],
+                 gold_paragraphs=["ctx"], level="custom", hop=1) for i in range(3)]
+        + [Example(question=f"mh{i}", answer="g", paragraphs=["ctx"],
+                   gold_paragraphs=["ctx"], level="custom", hop=2) for i in range(3)]
+    )
+    score = ev.evaluate(RagConfig(), examples, verbose=False)
+    assert score.by_hop == {"1": 0.0, "2": 1.0}
+    # 單一難度層 -> 不報分層 (避免沒資訊的欄位)
+    score2 = ev.evaluate(RagConfig(), examples[:3], verbose=False)
+    assert score2.by_hop is None
+
+
+# --- Bandit (UCB) ---------------------------------------------------------------------
+def test_ucb_prefers_good_dimension():
+    from memory.trajectory import Trial
+    from optimizer import _dim_stats, _ucb_value, _config_from_proposal
+
+    def trial(cfg, obj):
+        return Trial(config=cfg, score={}, objective=obj, lam=0.5)
+
+    # verify=True 的試驗分數高、False 低 (其餘維度相同)
+    hi = dict(FULL_CFG, verify=True)
+    lo = dict(FULL_CFG, verify=False)
+    trials = [trial(hi, 0.9), trial(dict(hi, top_k=3), 0.85),
+              trial(lo, 0.2), trial(dict(lo, top_k=3), 0.15)]
+    stats = _dim_stats(trials)
+    cand_hi = _config_from_proposal(dict(hi, chunk_size=1024))
+    cand_lo = _config_from_proposal(dict(lo, chunk_size=1024))
+    assert _ucb_value(cand_hi, stats, 4) > _ucb_value(cand_lo, stats, 4)
+    # 未試過的取值有樂觀加成 (強迫探索): graph 沒試過 -> 分數不會被打死
+    cand_new = _config_from_proposal(dict(hi, retriever="graph"))
+    assert _ucb_value(cand_new, stats, 4) > _ucb_value(cand_lo, stats, 4)

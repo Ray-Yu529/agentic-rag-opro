@@ -1,8 +1,9 @@
 """
-run.py — 主編排: random vs OPRO vs hybrid 對照 (多目標)
+run.py — 主編排: random vs bandit(UCB) vs OPRO vs hybrid 對照 (多目標)
 
-搜索空間 216 組，三種策略各用 BUDGET 次評估去找最佳配置。
-分數查共用 cache.json (查過不重跑)，OPRO/hybrid 額外呼叫 meta-LLM 推理。
+搜索空間 27648 組，四種策略各用 BUDGET 次評估去找最佳配置。
+分數查共用 cache.json (查過不重跑)；OPRO/hybrid 額外呼叫 meta-LLM 推理，
+bandit 是「零 LLM、純邊際統計 UCB」的中間 baseline。
 
 資料集二選一:
   預設                      HotpotQA 分層子集 (N/N_HARD)
@@ -29,7 +30,7 @@ from dotenv import load_dotenv
 
 from eval import load_hotpot
 from cache import ResultCache, dataset_key, custom_dataset_key
-from optimizer import DEFAULT_LAMBDA, random_search, opro_search
+from optimizer import DEFAULT_LAMBDA, bandit_search, random_search, opro_search
 from hybrid import hybrid_search
 from memory import warmstart
 
@@ -106,7 +107,8 @@ def main() -> None:
         warm = warmstart.suggest(feats, k=2, exclude_dataset=dkey) or None
         print(f"warm-start 建議: {warm or '無 (記憶庫還是空的)'}")
 
-    finals: dict[str, list[float]] = {"random": [], "opro": [], "hybrid": []}
+    finals: dict[str, list[float]] = {"random": [], "bandit": [],
+                                      "opro": [], "hybrid": []}
     overall_best = None
     for seed in seeds:
         sfx = "" if len(seeds) == 1 else f"_s{seed}"
@@ -118,6 +120,12 @@ def main() -> None:
                              traj_path=str(RESULTS / f"random{sfx}.jsonl"),
                              mu=args.mu)
         summarize("random", rand)
+
+        print("\n=== Bandit (UCB) baseline ===")
+        band = bandit_search(examples, cache, budget=BUDGET, seed=seed, n_init=N_INIT,
+                             traj_path=str(RESULTS / f"bandit{sfx}.jsonl"),
+                             mu=args.mu)
+        summarize("bandit", band)
 
         print("\n=== OPRO meta-optimizer ===")
         opro = opro_search(examples, cache, budget=BUDGET, seed=seed, n_init=N_INIT,
@@ -131,7 +139,8 @@ def main() -> None:
                             mu=args.mu, warm_configs=warm)
         summarize("hybrid", hyb)
 
-        for name, traj in (("random", rand), ("opro", opro), ("hybrid", hyb)):
+        for name, traj in (("random", rand), ("bandit", band),
+                           ("opro", opro), ("hybrid", hyb)):
             b = traj.best()
             finals[name].append(b.objective)
             if overall_best is None or b.objective > overall_best.objective:

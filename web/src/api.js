@@ -23,3 +23,17 @@ export async function getHistory() {
   const r = await fetch("/api/history");
   return r.json();
 }
+
+export async function ask(payload) {
+  const r = await fetch("/api/ask", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  return r.json();
+}
+
+export async function getRecords() {
+  const r = await fetch("/api/records");
+  return r.json();
+}

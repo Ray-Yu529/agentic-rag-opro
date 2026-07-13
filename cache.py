@@ -31,12 +31,12 @@ CACHE_PATH = Path(os.environ.get("CACHE_PATH",
 # 搜索空間的全部維度 (RagConfig.key() / 快取鍵 / 軌跡去重共用這份定義)
 CONFIG_FIELDS = ("chunk_size", "top_k", "retriever", "chunk_overlap",
                  "hybrid_alpha", "rerank", "query_decompose", "hyde",
-                 "iterative", "verify")
+                 "iterative", "compress", "parent_child", "verify")
 _FIELDS = CONFIG_FIELDS   # 舊名
 
 # 評估邏輯/指標「語意」改動時手動 +1 (例如改判官 prompt、改 recall 定義)，
-# 讓舊 cache 全部失效。v4: graph 檢索/α/hyde/iterative 進搜索空間。
-EVAL_VERSION = 4
+# 讓舊 cache 全部失效。v5: compress/parent_child 進搜索空間 + hop 分層。
+EVAL_VERSION = 5
 
 
 def _eval_fingerprint() -> str:

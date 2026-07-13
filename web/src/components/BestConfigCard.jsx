@@ -10,6 +10,8 @@ const KNOBS = [
   ["query_decompose", "查詢分解"],
   ["hyde", "HyDE 改寫"],
   ["iterative", "迭代檢索"],
+  ["compress", "壓縮上下文"],
+  ["parent_child", "父段落餵入"],
   ["verify", "NLI 守門員"],
 ];
 
@@ -28,6 +30,10 @@ export default function BestConfigCard({ best }) {
         <Metric label="objective" value={best.objective.toFixed(3)} big />
         <Metric label="正確率" value={(s.correctness * 100).toFixed(0) + "%"} />
         <Metric label="幻覺率" value={((1 - s.faithfulness) * 100).toFixed(0) + "%"} warn />
+        {s.by_hop && Object.entries(s.by_hop).map(([h, v]) => (
+          <Metric key={h} label={h === "2" ? "多跳正確率" : "單跳正確率"}
+                  value={(v * 100).toFixed(0) + "%"} />
+        ))}
         <Metric label="成本" value={s.avg_latency.toFixed(1) + "s"} />
       </div>
       <div className="knob-grid">

@@ -311,7 +311,8 @@ def build_examples(paragraphs: list[str], qa_records: list[dict],
             continue
         examples.append(Example(
             question=str(r["question"]), answer=str(r["answer"]),
-            paragraphs=paragraphs, gold_paragraphs=golds, level="custom"))
+            paragraphs=paragraphs, gold_paragraphs=golds, level="custom",
+            hop=int(r.get("hop", 1))))
     if dropped:
         say(f"  [warn] {dropped} 題的答案/gold 在語料中定位不到，已剔除")
     if not examples:

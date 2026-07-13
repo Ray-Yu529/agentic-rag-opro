@@ -53,6 +53,7 @@ class Example:
     paragraphs: list[str]        # 該題 context 的段落文字 (含 distractor)
     gold_paragraphs: list[str]   # supporting_facts 指到的 gold 段落文字
     level: str                   # "easy" | "medium" | "hard"
+    hop: int = 1                 # 1=單跳, 2=多跳 (custom 由 QA 的 hop 欄位決定)
 
 
 def _build_example(row: dict) -> Example:
@@ -71,6 +72,7 @@ def _build_example(row: dict) -> Example:
         paragraphs=paragraphs,
         gold_paragraphs=gold_paragraphs,
         level=row.get("level", "medium"),
+        hop=2,   # HotpotQA 全是多跳題 (單一 hop 群不會觸發分層報告)
     )
 
 
@@ -165,6 +167,7 @@ class QuestionDetail:
     faithful: float         # NLI 忠實度: 答案是否被 context 支持 (1/0)
     correct: float          # LLM 判官語意正確性 (1/0)
     fail_type: str          # "ok" | "retrieval" | "generation" — 失敗分群用
+    hop: int                # 1=單跳, 2=多跳 (難度分層報告用)
     retrieved_preview: str  # 檢索到的 chunk 前段，讓 LLM 看真因
 
     def as_dict(self) -> dict:
@@ -172,7 +175,8 @@ class QuestionDetail:
             "question": self.question, "gold": self.gold, "pred": self.pred,
             "em": self.em, "f1": self.f1, "recall": self.recall,
             "faithful": self.faithful, "correct": self.correct,
-            "fail_type": self.fail_type, "retrieved_preview": self.retrieved_preview,
+            "fail_type": self.fail_type, "hop": self.hop,
+            "retrieved_preview": self.retrieved_preview,
         }
 
 
@@ -189,6 +193,7 @@ class EvalScore:
     n: int                     # 實際成功評估的題數 (分母)
     n_errors: int = 0          # API 失敗被跳過的題數 (過多會整輪作廢，見 evaluate)
     judge_agreement: float | None = None   # 主/稽核判官一致率 (抽查關閉時 None)
+    by_hop: dict | None = None # 難度分層正確率 {"1": x, "2": y} (單一群時 None)
     details: list[QuestionDetail] = None
 
     def as_dict(self) -> dict:
@@ -197,7 +202,7 @@ class EvalScore:
                 "abstain_rate": self.abstain_rate,
                 "avg_latency": self.avg_latency, "avg_tokens": self.avg_tokens,
                 "n": self.n, "n_errors": self.n_errors,
-                "judge_agreement": self.judge_agreement}
+                "judge_agreement": self.judge_agreement, "by_hop": self.by_hop}
 
     def hallucination_rate(self) -> float:
         return 1.0 - self.faithfulness
@@ -247,7 +252,7 @@ def _partial_score(em_s, f1_s, rec_s, faith_s, corr_s, abst_s, lat_s, tok_s,
             "faithfulness": faith_s / n, "correctness": corr_s / n,
             "abstain_rate": abst_s / n, "avg_latency": lat_s / n,
             "avg_tokens": tok_s / n, "n": n_ok, "n_errors": errors,
-            "pruned": True}
+            "judge_agreement": None, "by_hop": None, "pruned": True}
 
 
 def evaluate(cfg: RagConfig, examples: list[Example], verbose: bool = True,
@@ -301,7 +306,7 @@ def evaluate(cfg: RagConfig, examples: list[Example], verbose: bool = True,
         details.append(QuestionDetail(
             question=ex.question, gold=ex.answer, pred=res.answer,
             em=em, f1=f1, recall=rec, faithful=faithful, correct=correct,
-            fail_type=_classify(rec, correct, abstained),
+            fail_type=_classify(rec, correct, abstained), hop=ex.hop,
             retrieved_preview=" | ".join(c[:120] for c in res.retrieved_chunks[:3]),
         ))
 
@@ -330,13 +335,20 @@ def evaluate(cfg: RagConfig, examples: list[Example], verbose: bool = True,
         raise RuntimeError(
             f"評估失敗題過多 ({errors}/{len(examples)})，本輪分數作廢、不寫入快取；"
             "多半是 API 持續 429/5xx，稍後重跑即可續跑。")
+    # 難度分層正確率 (單跳 vs 多跳): 只有一群時不報，免得表面上多個沒資訊的欄位
+    groups: dict[int, list[float]] = {}
+    for d in details:
+        groups.setdefault(d.hop, []).append(d.correct)
+    by_hop = ({str(h): sum(v) / len(v) for h, v in sorted(groups.items())}
+              if len(groups) > 1 else None)
+
     return EvalScore(em=em_s / n_ok, f1=f1_s / n_ok, recall=rec_s / n_ok,
                      faithfulness=faith_s / n_ok, correctness=corr_s / n_ok,
                      abstain_rate=abst_s / n_ok,
                      avg_latency=lat_s / n_ok, avg_tokens=tok_s / n_ok,
                      n=n_ok, n_errors=errors,
                      judge_agreement=(agree_s / audit_n if audit_n else None),
-                     details=details)
+                     by_hop=by_hop, details=details)
 
 
 if __name__ == "__main__":
@@ -353,6 +365,10 @@ if __name__ == "__main__":
     print(f"  correctness  = {score.correctness:.3f} (LLM judge)")
     print(f"  faithfulness = {score.faithfulness:.3f} (幻覺率 {score.hallucination_rate():.3f})")
     print(f"  abstain rate = {score.abstain_rate:.3f} (守門員棄答比例)")
+    if score.by_hop:
+        parts = ", ".join(f"{'單跳' if h == '1' else '多跳'}={v:.3f}"
+                          for h, v in score.by_hop.items())
+        print(f"  分層正確率  = {parts}")
     if score.judge_agreement is not None:
         print(f"  judge agree  = {score.judge_agreement:.3f} (雙判官一致率；<0.8 該換判官)")
     print(f"  cost         = {score.avg_latency:.2f}s, {score.avg_tokens:.0f} tok/題")

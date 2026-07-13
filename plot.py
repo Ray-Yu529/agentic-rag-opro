@@ -33,8 +33,10 @@ def _last_meta() -> dict:
     return {}
 
 RESULTS = Path(__file__).parent / "results"
-# 與 Web UI 同一套系列色 (CVD/對比已驗證): opro=blue, hybrid=aqua, random=中性灰
+# 與 Web UI 同一套系列色 (CVD/對比已驗證):
+# opro=blue, hybrid=aqua, bandit=violet, random=中性灰
 STRATEGIES = {"random.jsonl": ("Random", "#898781", "o"),
+              "bandit.jsonl": ("Bandit", "#4a3aa7", "D"),
               "opro.jsonl": ("OPRO", "#2a78d6", "s"),
               "hybrid.jsonl": ("Hybrid", "#1baf7a", "^")}
 

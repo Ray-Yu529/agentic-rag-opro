@@ -7,6 +7,8 @@ import ObjectiveChart from "./components/ObjectiveChart.jsx";
 import ParetoChart from "./components/ParetoChart.jsx";
 import Leaderboard from "./components/Leaderboard.jsx";
 import HistoryPanel from "./components/HistoryPanel.jsx";
+import PlaygroundPanel from "./components/PlaygroundPanel.jsx";
+import ComparePanel from "./components/ComparePanel.jsx";
 
 export default function App() {
   const [params, setParams] = useState({
@@ -80,8 +82,11 @@ export default function App() {
 
         <main>
           <BestConfigCard best={results?.best} />
+          <PlaygroundPanel best={results?.best} corpusText={params.corpus_text}
+                           running={running} />
           <ObjectiveChart strategies={results?.strategies} />
           <ParetoChart pareto={results?.pareto} />
+          <ComparePanel bump={running} />
           <Leaderboard strategies={results?.strategies} />
           <HistoryPanel runs={history} />
         </main>

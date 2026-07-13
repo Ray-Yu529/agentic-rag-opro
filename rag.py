@@ -107,30 +107,42 @@ class RagConfig:
     query_decompose: bool = False      # agentic: 多跳拆解
     hyde: bool = False                 # agentic: 生成假設答案當額外查詢 (HyDE)
     iterative: bool = False            # agentic: 看缺什麼、再檢索一輪
+    compress: bool = False             # agentic: 檢索後壓縮成與問題相關的句子
+    parent_child: bool = False         # 小 chunk 檢索命中，餵生成器時換完整父段落
     verify: bool = False               # agentic: NLI 自我檢查守門員
 
     def key(self) -> tuple:
         return (self.chunk_size, self.top_k, self.retriever, self.chunk_overlap,
                 self.hybrid_alpha, self.rerank, self.query_decompose,
-                self.hyde, self.iterative, self.verify)
+                self.hyde, self.iterative, self.compress, self.parent_child,
+                self.verify)
 
 
 # --- 1. Chunking -----------------------------------------------------------
-def make_chunks(paragraphs: list[str], cfg: RagConfig) -> list[str]:
+def make_chunks_with_parents(paragraphs: list[str],
+                             cfg: RagConfig) -> tuple[list[str], list[int]]:
+    """切 chunk 並記住每個 chunk 的父段落 index (parent_child 檢索用)。"""
     chunks: list[str] = []
+    parents: list[int] = []
     step = max(1, cfg.chunk_size - cfg.chunk_overlap)
-    for para in paragraphs:
+    for pi, para in enumerate(paragraphs):
         text = para.strip()
         if not text:
             continue
         if len(text) <= cfg.chunk_size:
             chunks.append(text)
+            parents.append(pi)
             continue
         for start in range(0, len(text), step):
             piece = text[start:start + cfg.chunk_size].strip()
             if piece:
                 chunks.append(piece)
-    return chunks
+                parents.append(pi)
+    return chunks, parents
+
+
+def make_chunks(paragraphs: list[str], cfg: RagConfig) -> list[str]:
+    return make_chunks_with_parents(paragraphs, cfg)[0]
 
 
 # --- 2. Retrievers ---------------------------------------------------------
@@ -470,6 +482,62 @@ def generate(query: str, retrieved_chunks: list[str]) -> tuple[str, int]:
     return resp.choices[0].message.content.strip(), tokens
 
 
+_CITE_SUFFIX = (" After the answer, cite the numbers of the context passages "
+                "that support it, in square brackets, e.g. [1][3].")
+
+
+def generate_cited(query: str, retrieved_chunks: list[str]) -> tuple[str, list[int], int]:
+    """帶引用標註的生成 (Playground 用；評估管線不用，以免污染 EM/F1)。
+    回傳 (答案含 [n] 標記, 有效引用的 chunk 編號, tokens)。"""
+    client = get_client()
+    context = "\n\n".join(f"[{i+1}] {c}" for i, c in enumerate(retrieved_chunks))
+    user_msg = f"Context:\n{context}\n\nQuestion: {query}\nShort answer:"
+    resp = api_call(
+        client.chat.completions.create,
+        model=GEN_MODEL,
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT + _CITE_SUFFIX},
+            {"role": "user", "content": user_msg},
+        ],
+        temperature=0.0,
+        max_tokens=96,
+    )
+    tokens = resp.usage.total_tokens if resp.usage else 0
+    answer = resp.choices[0].message.content.strip()
+    cites = sorted({int(m) for m in re.findall(r"\[(\d+)\]", answer)
+                    if 1 <= int(m) <= len(retrieved_chunks)})
+    return answer, cites, tokens
+
+
+def strip_citations(answer: str) -> str:
+    """拿掉 [n] 引用標記 (餵 NLI 判官 / 棄答偵測前用，避免干擾判定)。"""
+    return re.sub(r"\s*\[\d+\]", "", answer).strip()
+
+
+def compress_chunks(question: str, chunks: list[str]) -> tuple[list[str], int]:
+    """compress (agentic): 把檢索到的 chunk 壓成「與問題相關的原句」再餵生成器
+    —— 降 token 成本、升信噪比 (與 μ 成本懲罰互補: 最佳化器可學會用
+    compress 換更大的 top_k)。壓到全空時退回原文，別讓生成器沒 context。"""
+    client = get_client()
+    context = "\n\n".join(f"[{i+1}] {c}" for i, c in enumerate(chunks))
+    prompt = (
+        "From the CONTEXT passages, copy VERBATIM only the sentences that are "
+        "relevant to answering the QUESTION. Do not paraphrase, do not add "
+        "anything, omit passages with nothing relevant.\n\n"
+        f"CONTEXT:\n{context}\n\nQUESTION: {question}\nRelevant sentences:"
+    )
+    resp = api_call(
+        client.chat.completions.create,
+        model=GEN_MODEL,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.0,
+        max_tokens=512,
+    )
+    tokens = resp.usage.total_tokens if resp.usage else 0
+    text = resp.choices[0].message.content.strip()
+    return ([text] if text else chunks), tokens
+
+
 # --- 7. 完整 pipeline ------------------------------------------------------
 @dataclass
 class RagResult:
@@ -478,14 +546,17 @@ class RagResult:
     retrieved_chunks: list[str] = field(default_factory=list)
     faithful: float | None = None      # verify 開啟時的 NLI 結果 (1/0)，否則 None
     abstained: bool = False            # verify 守門員最終棄答
+    citations: list[int] = field(default_factory=list)   # cite=True 時的引用編號
     tokens: int = 0                    # 成本: 累計 token (生成+分解+embedding+守門員判官)
     latency: float = 0.0               # 成本: 秒
 
 
-def run_rag(question: str, paragraphs: list[str], cfg: RagConfig) -> RagResult:
+def run_rag(question: str, paragraphs: list[str], cfg: RagConfig,
+            cite: bool = False) -> RagResult:
     """單題完整流程:
     (decompose)(hyde) -> retrieve(+rerank) -> (iterative 缺口再檢索)
-    -> generate -> (verify)。"""
+    -> (parent_child 換父段落) -> (compress) -> generate -> (verify)。
+    cite=True 時生成器附 [n] 引用 (Playground 用；評估管線一律 False)。"""
     t0 = time.perf_counter()
     tokens = 0
 
@@ -499,38 +570,66 @@ def run_rag(question: str, paragraphs: list[str], cfg: RagConfig) -> RagResult:
         if hq:
             queries = queries + [hq]   # 與原問題/子問題 max-融合
 
-    chunks = make_chunks(paragraphs, cfg)
+    chunks, parents = make_chunks_with_parents(paragraphs, cfg)
     index = ChunkIndex(chunks)
+
+    def to_context(sel: list[int]) -> list[str]:
+        """parent_child: 小 chunk 檢索命中，餵生成器/判官時換成完整父段落 (去重)
+        —— 檢索精準命中、生成拿到完整上下文，兩頭都要。"""
+        if not cfg.parent_child:
+            return [chunks[i] for i in sel]
+        seen, out = set(), []
+        for i in sel:
+            p = parents[i]
+            if p not in seen:
+                seen.add(p)
+                out.append(paragraphs[p].strip())
+        return out
+
+    def make_answer(context: list[str]) -> tuple[str, list[int]]:
+        nonlocal tokens
+        gen_ctx = context
+        if cfg.compress and context:
+            gen_ctx, ct = compress_chunks(question, context)
+            tokens += ct
+        if cite:
+            ans, cites, gt = generate_cited(question, gen_ctx)
+            if cfg.compress:
+                cites = []   # 壓縮後編號對不回原 chunk，不提供錯誤的高亮
+        else:
+            ans, gt = generate(question, gen_ctx)
+            cites = []
+        tokens += gt
+        return ans, cites
+
     idx = retrieve(index, queries, cfg)
 
     if cfg.iterative and idx:
         # 第一輪 context 缺什麼 -> 追加查詢再檢索，合併 (上限與 verify 拓寬一致)
-        gq, gt0 = gap_query(question, [chunks[i] for i in idx])
+        gq, gt0 = gap_query(question, to_context(idx))
         tokens += gt0
         if gq:
             merged = list(idx)
             merged += [i for i in retrieve(index, [gq], cfg) if i not in merged]
             idx = merged[:min(cfg.top_k + 3, len(chunks))]
 
-    picked = [chunks[i] for i in idx]
-    answer, gt = generate(question, picked)
-    tokens += gt
+    picked = to_context(idx)
+    answer, citations = make_answer(picked)
 
     faithful = None
     abstained = False
     if cfg.verify:
         # 局部 import 避免 rag <-> judge 循環引用
         from judge import judge_faithfulness
-        faithful, jt = judge_faithfulness(answer, picked)
+        faithful, jt = judge_faithfulness(strip_citations(answer), picked)
         tokens += jt
         if faithful < 1.0:
             # 守門員觸發: 拓寬檢索再答一次
             wider = replace(cfg, top_k=min(cfg.top_k + 3, len(chunks)), verify=False)
             idx = retrieve(index, queries, wider)
-            picked = [chunks[i] for i in idx]
-            answer, gt = generate(question, picked)
-            tokens += gt
-            faithful, jt = judge_faithfulness(answer, picked)
+            picked = to_context(idx)
+            answer, citations = make_answer(picked)
+            faithful, jt = judge_faithfulness(strip_citations(answer), picked)
             tokens += jt
             if faithful < 1.0:
                 # 仍不忠實 -> 棄答，寧可不答也不要幻覺。
@@ -539,11 +638,12 @@ def run_rag(question: str, paragraphs: list[str], cfg: RagConfig) -> RagResult:
                 answer = ABSTAIN
                 abstained = True
                 faithful = 1.0
+                citations = []
 
     tokens += index.embed_tokens + index.extra_tokens
     return RagResult(answer=answer, retrieved_idx=idx, retrieved_chunks=picked,
-                     faithful=faithful, abstained=abstained, tokens=tokens,
-                     latency=time.perf_counter() - t0)
+                     faithful=faithful, abstained=abstained, citations=citations,
+                     tokens=tokens, latency=time.perf_counter() - t0)
 
 
 if __name__ == "__main__":

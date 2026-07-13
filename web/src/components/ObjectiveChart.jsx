@@ -4,7 +4,8 @@ import {
   LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer,
 } from "recharts";
 
-const COLORS = { random: "#898781", opro: "#2a78d6", hybrid: "#1baf7a" };
+const COLORS = { random: "#898781", opro: "#2a78d6", hybrid: "#1baf7a",
+                 bandit: "#4a3aa7" };
 const AXIS = { fontSize: 12, fill: "#898781" };
 
 export default function ObjectiveChart({ strategies }) {
