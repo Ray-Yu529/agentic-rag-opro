@@ -97,7 +97,7 @@ def test_fingerprint(paras):
 
 
 def test_generate_qa_guard(paras, monkeypatch):
-    def fake_chat_json(prompt, temperature, max_tokens, model=None):
+    def fake_chat_json(prompt, temperature, max_tokens, model=None, task=None):
         if "巴黎鐵塔" in prompt:
             return {"question": "巴黎鐵塔位於哪裡?", "answer": "法國巴黎"}
         return {"question": "聖母院始建於哪一年?", "answer": "1163 年"}
@@ -127,7 +127,7 @@ def test_multihop_pairs_and_generation(monkeypatch):
     pairs = _related_pairs(paras, random.Random(0))
     assert (0, 1) in pairs and (0, 2) not in pairs
 
-    def fake_chat_json(prompt, temperature, max_tokens, model=None):
+    def fake_chat_json(prompt, temperature, max_tokens, model=None, task=None):
         if "PASSAGE 2" in prompt:   # 多跳 prompt
             return {"question": "When was the center researching qubits founded?",
                     "answer": "1998"}

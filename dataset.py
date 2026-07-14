@@ -179,9 +179,10 @@ def _related_pairs(paragraphs: list[str], rng: random.Random) -> list[tuple[int,
     return pairs
 
 
-def _gen_one(prompt: str, passages: list[str]) -> dict | None:
+def _gen_one(prompt: str, passages: list[str], task: str = "qa_gen") -> dict | None:
     """呼叫 LLM 生成一題；答案必須是某段落內的 span，否則回 None (品質守門)。"""
-    result = chat_json(prompt, temperature=0.3, max_tokens=300, model=QA_GEN_MODEL)
+    result = chat_json(prompt, temperature=0.3, max_tokens=300,
+                       model=QA_GEN_MODEL, task=task)
     q = str(result.get("question", "")).strip()
     a = str(result.get("answer", "")).strip()
     if not q or not a:
@@ -210,7 +211,7 @@ def generate_qa(paragraphs: list[str], n: int, seed: int = 42,
             pair = [paragraphs[i], paragraphs[j]]
             prompt = (_MULTIHOP_PROMPT
                       + f"PASSAGE 1:\n{pair[0]}\n\nPASSAGE 2:\n{pair[1]}")
-            rec = _gen_one(prompt, pair)
+            rec = _gen_one(prompt, pair, task="qa_gen_multihop")
             if rec:
                 rec["hop"] = 2
                 qa.append(rec)

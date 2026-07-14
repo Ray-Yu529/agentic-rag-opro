@@ -35,7 +35,7 @@ DEFAULT_MU = 0.0      # 成本懲罰權重: objective -= μ × (每題平均 tok
 
 
 def chat_json(prompt: str, temperature: float, max_tokens: int,
-              model: str = META_MODEL) -> dict:
+              model: str = META_MODEL, task: str = "opro_meta") -> dict:
     """呼叫 LLM 並解析 JSON (預設 meta 模型，dataset.py 的 QA 生成也共用)。
     優先用 API 的 JSON mode；模型不支援時退回一般模式 + regex 擷取。
     解析失敗回 {}。"""
@@ -45,9 +45,10 @@ def chat_json(prompt: str, temperature: float, max_tokens: int,
                   temperature=temperature, max_tokens=max_tokens)
     try:
         resp = api_call(client.chat.completions.create,
-                        response_format={"type": "json_object"}, **kwargs)
+                        response_format={"type": "json_object"},
+                        distill_task=task, **kwargs)
     except BadRequestError:  # 端點不支援 JSON mode (400) 才退回一般模式；其他錯誤照拋
-        resp = api_call(client.chat.completions.create, **kwargs)
+        resp = api_call(client.chat.completions.create, distill_task=task, **kwargs)
     m = re.search(r"\{.*\}", resp.choices[0].message.content, re.DOTALL)
     if not m:
         return {}

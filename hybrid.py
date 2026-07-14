@@ -46,7 +46,8 @@ def _ask_region(traj: Trajectory) -> dict:
 請判斷哪些值得繼續搜，把每個維度限縮成「值得搜的子集」(可只留 1~2 個值)，砍掉看起來沒用的。
 只輸出 JSON: {{"reasoning":"...", "region":{example}}} (region 每個維度填入保留的值)"""
 
-    region = chat_json(prompt, temperature=0.3, max_tokens=600).get("region", {})
+    region = chat_json(prompt, temperature=0.3, max_tokens=600,
+                       task="hybrid_region").get("region", {})
     # 清洗: 子集必須 ⊆ 合法值，否則該維度退回全集
     clean = {}
     for dim, allowed in SEARCH_SPACE.items():

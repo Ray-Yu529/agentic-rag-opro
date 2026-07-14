@@ -1,0 +1,11 @@
+# distill.py 的 train 子命令用 (需要 GPU)。stats/export/modelfile 不需要這些，
+# 只用標準函式庫，跟 requirements.txt 完全無關。
+#
+# 安裝: pip install -r requirements-distill.txt
+# 需要先裝好對應 CUDA 版本的 PyTorch (見 https://pytorch.org/get-started/locally/)；
+# 這裡不鎖 torch 版本，因為它跟本機 CUDA 版本綁定，統一鎖版本反而容易裝錯。
+transformers>=4.44.0
+peft>=0.12.0          # LoRA
+trl>=0.10.0           # SFTTrainer
+datasets>=2.18.0      # 讀 SFT jsonl (同 requirements.txt 已有的版本即可)
+accelerate>=0.33.0

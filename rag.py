@@ -19,11 +19,13 @@ rag.py — 被優化的 Agentic RAG 系統
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 import time
 from dataclasses import dataclass, field, replace
 from functools import lru_cache
+from pathlib import Path
 
 import numpy as np
 import requests
@@ -35,7 +37,10 @@ from rank_bm25 import BM25Okapi
 load_dotenv()  # 先讀 .env，下面模型 id 的環境變數覆寫才吃得到
 
 # --- NVIDIA NIM 端點設定 ---------------------------------------------------
-NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
+# BASE_URL 可覆寫指向任何 OpenAI 相容端點 (私有部署、或 distill.py 蒸餾出的
+# 本地模型架起的 Ollama/vLLM/llama.cpp server)。換掉這一個變數，rag.py/
+# judge.py/optimizer.py/dataset.py 全部不用改就能離線跑。
+NVIDIA_BASE_URL = os.environ.get("BASE_URL", "https://integrate.api.nvidia.com/v1")
 # 模型 id 可用環境變數覆寫 (端點 404/不穩時換模型，或換私有 OpenAI 相容端點)
 GEN_MODEL = os.environ.get("GEN_MODEL", "meta/llama-3.1-8b-instruct")     # generator (便宜、量大)
 EMBED_MODEL = os.environ.get("EMBED_MODEL", "nvidia/llama-3.2-nv-embedqa-1b-v2")  # dense 檢索
@@ -87,11 +92,38 @@ def get_client() -> OpenAI:
 _RETRIABLE = (RateLimitError, APIConnectionError, APITimeoutError, InternalServerError)
 
 
-def api_call(fn, *args, retries: int = 5, base_delay: float = 2.0, **kwargs):
-    """呼叫 API；429 / 連線逾時 / 5xx 時指數退避重試，重試耗盡才拋出。"""
+def _distill_log(task: str | None, kwargs: dict, resp) -> None:
+    """DISTILL_LOG_PATH 設定時，把這通 chat completion 存成 SFT 訓練樣本
+    (見 distill.py)。只記聊天完成 (kwargs 有 messages)，embedding 不記。
+    task 標記呼叫來源 (generate/judge_correctness/opro_meta/...)，讓之後
+    可以只挑單一任務蒸餾，而不是把不同性質的行為混成一個模型。
+    記錄失敗 (磁碟滿/權限等) 絕不能弄壞正常的 API 呼叫，一律吞掉。"""
+    path = os.environ.get("DISTILL_LOG_PATH")
+    if not path or "messages" not in kwargs:
+        return
+    try:
+        content = resp.choices[0].message.content
+        row = {"task": task or "unknown", "model": kwargs.get("model"),
+              "messages": kwargs["messages"], "completion": content,
+              "ts": time.time()}
+        p = Path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with p.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+    except Exception:  # noqa: BLE001 — 蒐集資料失敗不該讓正常呼叫跟著失敗
+        pass
+
+
+def api_call(fn, *args, retries: int = 5, base_delay: float = 2.0,
+             distill_task: str | None = None, **kwargs):
+    """呼叫 API；429 / 連線逾時 / 5xx 時指數退避重試，重試耗盡才拋出。
+    distill_task 給定且 DISTILL_LOG_PATH 有設時，成功回應會被記成訓練樣本
+    (見 distill.py / 下方 README「本地/離線模型」)。"""
     for attempt in range(retries):
         try:
-            return fn(*args, **kwargs)
+            resp = fn(*args, **kwargs)
+            _distill_log(distill_task, kwargs, resp)
+            return resp
         except _RETRIABLE:
             if attempt == retries - 1:
                 raise
@@ -333,6 +365,7 @@ def decompose_query(question: str) -> tuple[list[str], int]:
         messages=[{"role": "user", "content": prompt}],
         temperature=0.0,
         max_tokens=128,
+        distill_task="decompose",
     )
     tokens = resp.usage.total_tokens if resp.usage else 0
     subs = [_clean_subquestion(ln) for ln in resp.choices[0].message.content.splitlines()]
@@ -356,6 +389,7 @@ def hyde_query(question: str) -> tuple[str, int]:
         messages=[{"role": "user", "content": prompt}],
         temperature=0.3,
         max_tokens=60,
+        distill_task="hyde",
     )
     tokens = resp.usage.total_tokens if resp.usage else 0
     return resp.choices[0].message.content.strip(), tokens
@@ -379,6 +413,7 @@ def gap_query(question: str, chunks: list[str]) -> tuple[str | None, int]:
         messages=[{"role": "user", "content": prompt}],
         temperature=0.0,
         max_tokens=48,
+        distill_task="gap_query",
     )
     tokens = resp.usage.total_tokens if resp.usage else 0
     text = resp.choices[0].message.content.strip()
@@ -486,6 +521,7 @@ def generate(query: str, retrieved_chunks: list[str]) -> tuple[str, int]:
         ],
         temperature=0.0,
         max_tokens=64,
+        distill_task="generate",
     )
     tokens = resp.usage.total_tokens if resp.usage else 0
     return resp.choices[0].message.content.strip(), tokens
@@ -510,6 +546,7 @@ def generate_cited(query: str, retrieved_chunks: list[str]) -> tuple[str, list[i
         ],
         temperature=0.0,
         max_tokens=96,
+        distill_task="generate_cited",
     )
     tokens = resp.usage.total_tokens if resp.usage else 0
     answer = resp.choices[0].message.content.strip()
@@ -541,6 +578,7 @@ def compress_chunks(question: str, chunks: list[str]) -> tuple[list[str], int]:
         messages=[{"role": "user", "content": prompt}],
         temperature=0.0,
         max_tokens=512,
+        distill_task="compress",
     )
     tokens = resp.usage.total_tokens if resp.usage else 0
     text = resp.choices[0].message.content.strip()
