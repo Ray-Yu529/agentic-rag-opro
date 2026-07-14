@@ -169,7 +169,9 @@ def test_modelfile_template():
 
 # --- distill.py: train() 的 GPU guard --------------------------------------------
 def test_train_requires_cuda_when_torch_present():
-    import torch  # 這台機器確實裝了 torch (CPU-only)，驗證「有 torch 但無 CUDA」的分支
+    # torch 不是 requirements.txt 的依賴 (CI/一般環境不會裝)；只有在剛好裝了
+    # torch 的機器上才驗證「有 torch 但無 CUDA」這個分支，其餘環境乾淨跳過。
+    torch = pytest.importorskip("torch")
     if torch.cuda.is_available():
         pytest.skip("這台機器有 CUDA，guard 分支不適用")
     with pytest.raises(SystemExit, match="CUDA|GPU"):
